@@ -26,6 +26,7 @@ class EventCategory(str, Enum):
     GDP = "gdp"
     RETAIL_SALES = "retail_sales"
     OPEC = "opec"
+    CRYPTO = "crypto"
     CUSTOM = "custom"
 
     def __str__(self) -> str:
@@ -43,6 +44,7 @@ EVENT_CATEGORY_LABELS = {
     EventCategory.GDP: "GDP Release",
     EventCategory.RETAIL_SALES: "Retail Sales Data",
     EventCategory.OPEC: "OPEC Decision",
+    EventCategory.CRYPTO: "Crypto Event (Hacks, Collapses, Regulation, etc.)",
     EventCategory.CUSTOM: "Custom Event",
 }
 
@@ -160,6 +162,26 @@ BUILTIN_EVENTS: list[MarketEvent] = [
     # ── OPEC ─────────────────────────────────────────────────────────────────
     MarketEvent("OPEC+ Surprise Cut", "2023-04-03", EventCategory.OPEC, "1.16M bpd surprise cut"),
     MarketEvent("OPEC+ Production Cut", "2024-06-02", EventCategory.OPEC, "Extended cuts through 2025"),
+
+    # ── Crypto Events ──────────────────────────────────────────────────────
+    MarketEvent("Bitcoin Futures Launch (CME)", "2017-12-18", EventCategory.CRYPTO, "CME BTC futures go live, BTC near $20K ATH"),
+    MarketEvent("Crypto Winter Begins", "2018-01-16", EventCategory.CRYPTO, "BTC crashes from $20K, broad crypto selloff"),
+    MarketEvent("China Crypto Ban", "2021-05-21", EventCategory.CRYPTO, "China bans financial institutions from crypto services"),
+    MarketEvent("China Mining Crackdown", "2021-06-21", EventCategory.CRYPTO, "Sichuan orders crypto miners to shut down, hashrate crashes"),
+    MarketEvent("El Salvador BTC Legal Tender", "2021-09-07", EventCategory.CRYPTO, "El Salvador adopts Bitcoin as legal tender, BTC flash crashes"),
+    MarketEvent("BTC All-Time High $69K", "2021-11-10", EventCategory.CRYPTO, "Bitcoin hits $68,789 ATH before reversal"),
+    MarketEvent("Luna/Terra Collapse", "2022-05-09", EventCategory.CRYPTO, "UST depeg triggers death spiral, $40B wiped out"),
+    MarketEvent("Three Arrows Capital Liquidation", "2022-06-15", EventCategory.CRYPTO, "3AC defaults, crypto contagion spreads"),
+    MarketEvent("Celsius Network Bankruptcy", "2022-07-13", EventCategory.CRYPTO, "Celsius files Ch.11, $4.7B in liabilities"),
+    MarketEvent("FTX Collapse", "2022-11-08", EventCategory.CRYPTO, "CoinDesk Alameda report triggers bank run, FTX halts withdrawals"),
+    MarketEvent("FTX Bankruptcy Filed", "2022-11-11", EventCategory.CRYPTO, "FTX files Ch.11, SBF resigns, $8B hole"),
+    MarketEvent("SEC Sues Binance", "2023-06-05", EventCategory.CRYPTO, "SEC files 13 charges against Binance and CZ"),
+    MarketEvent("SEC Sues Coinbase", "2023-06-06", EventCategory.CRYPTO, "SEC sues Coinbase for operating unregistered exchange"),
+    MarketEvent("Grayscale Wins SEC Lawsuit", "2023-08-29", EventCategory.CRYPTO, "Court rules SEC wrong to deny GBTC ETF conversion"),
+    MarketEvent("Spot BTC ETF Approved", "2024-01-10", EventCategory.CRYPTO, "SEC approves 11 spot Bitcoin ETFs"),
+    MarketEvent("Bitcoin Halving 2024", "2024-04-20", EventCategory.CRYPTO, "4th halving: block reward drops to 3.125 BTC"),
+    MarketEvent("Spot ETH ETF Approved", "2024-05-23", EventCategory.CRYPTO, "SEC approves spot Ethereum ETFs"),
+    MarketEvent("BTC New ATH $100K", "2024-12-05", EventCategory.CRYPTO, "Bitcoin crosses $100K for the first time"),
 ]
 
 
