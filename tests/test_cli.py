@@ -209,3 +209,38 @@ class TestExportCommand:
             "export", "SPY", "-e", "earnings", "-et", "NVDA", "-o", outfile,
         ])
         assert result.exit_code == 0
+
+
+# ── Scan command ──────────────────────────────────────────────────────────────
+
+
+class TestScanCommand:
+    def test_scan_help(self, runner):
+        result = runner.invoke(cli, ["scan", "--help"])
+        assert result.exit_code == 0
+        assert "--days" in result.output
+        assert "--lookback" in result.output
+        assert "--step" in result.output
+
+    @patch("quant_patterns.cli.get_data_provider")
+    def test_scan_runs(self, mock_get_dp, runner):
+        mock_dp = MagicMock()
+        mock_dp.name.return_value = "Mock"
+        mock_dp.get_daily_ohlcv.return_value = _mock_ohlcv(periods=200)
+        mock_get_dp.return_value = mock_dp
+
+        result = runner.invoke(cli, ["scan", "SPY", "-d", "10", "-l", "500", "-n", "3"])
+        assert result.exit_code == 0
+        assert "Scanning SPY" in result.output
+
+    @patch("quant_patterns.cli.get_data_provider")
+    def test_scan_with_export(self, mock_get_dp, runner, tmp_path):
+        mock_dp = MagicMock()
+        mock_dp.name.return_value = "Mock"
+        mock_dp.get_daily_ohlcv.return_value = _mock_ohlcv(periods=200)
+        mock_get_dp.return_value = mock_dp
+
+        outfile = str(tmp_path / "scan_export.json")
+        result = runner.invoke(cli, ["scan", "SPY", "-d", "10", "-l", "500", "-o", outfile])
+        assert result.exit_code == 0
+        assert "Exported" in result.output

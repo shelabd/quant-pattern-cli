@@ -28,6 +28,7 @@ from .analysis import (
     compare_windows,
     export_for_agent,
     find_support_resistance,
+    sliding_window_scan,
 )
 from .data import (
     DataProvider,
@@ -332,6 +333,178 @@ def sr(ticker, lookback, levels, window, provider, verbose):
         support_resistance=sr_levels,
     )
     console.print(chart)
+
+
+# ── SCAN command ───────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("ticker")
+@click.option("--days", "-d", default=10, help="Window size in trading days")
+@click.option("--lookback", "-l", default=1000, help="How many calendar days of history to scan")
+@click.option("--step", "-s", default=1, help="Slide step in trading days (1=daily, 5=weekly)")
+@click.option("--top-n", "-n", default=5, help="Number of top matches to show")
+@click.option("--export-json", "-o", default=None, help="Export results to JSON file")
+@common_options
+def scan(ticker, days, lookback, step, top_n, export_json, provider, verbose):
+    """
+    Scan history for periods most similar to recent price action. No events needed.
+
+    Slides a window across all historical data and ranks by similarity to the
+    most recent N trading days.
+
+    Examples:
+
+      qpat scan SPY --days 10 --lookback 1000
+
+      qpat scan NVDA -d 20 -l 2000 -s 5 -n 10
+
+      qpat scan QQQ -d 15 -l 1500 -o scan_results.json
+    """
+    setup_logging(verbose)
+    ticker = ticker.upper()
+    dp = get_data_provider(provider)
+
+    end = date.today()
+    start = end - timedelta(days=lookback)
+
+    console.print(f"\n[bold cyan]⚡ Scanning {ticker} for similar price patterns[/bold cyan]")
+    console.print(f"   Window: {days} trading days | Lookback: {lookback} calendar days | Step: {step}")
+    console.print(f"   Provider: {dp.name()}\n")
+
+    with Progress(SpinnerColumn(), TextColumn("[bold blue]Fetching historical data...")) as progress:
+        task = progress.add_task("fetch", total=None)
+        try:
+            df = dp.get_daily_ohlcv(ticker, start, end)
+        except Exception as e:
+            console.print(f"[red]Error: {e}[/red]")
+            return
+
+    console.print(f"  Loaded {len(df)} trading days ({df.index[0].date()} → {df.index[-1].date()})")
+
+    target_start = df.index[-days] if len(df) >= days else df.index[0]
+    console.print(f"  Target window: {target_start.date()} → {df.index[-1].date()}")
+    console.print(f"  Current close: ${df['Close'].iloc[-1]:.2f}\n")
+
+    with Progress(SpinnerColumn(), TextColumn("[bold blue]Scanning {task.description}")) as progress:
+        task = progress.add_task(
+            f"{len(df) - days} windows...",
+            total=None,
+        )
+        results = sliding_window_scan(df, window_size=days, step=step, top_n=top_n)
+
+    if not results:
+        console.print("[red]No similar patterns found.[/red]")
+        return
+
+    # Display results
+    display_similarity_results(results, top_n=top_n)
+
+    # Overlay chart: target vs top matches
+    target_df = df.iloc[-days:].copy()
+    target_df["rel_day"] = range(days)
+    target_ref = target_df["Close"].iloc[0]
+    target_df["Close_norm"] = ((target_df["Close"] / target_ref) - 1) * 100
+    display_comparison_chart(target_df, results, target_label="Current", max_overlays=3)
+
+    # S/R on recent data
+    console.print()
+    try:
+        sr_levels = find_support_resistance(df.tail(180))
+        current_price = df["Close"].iloc[-1]
+        display_support_resistance(sr_levels, current_price=current_price)
+
+        chart = ascii_price_chart(
+            df.tail(60),
+            title=f"{ticker} (Last 60 Trading Days)",
+            support_resistance=sr_levels,
+        )
+        console.print(f"\n{chart}\n")
+    except Exception as e:
+        logger.warning(f"S/R error: {e}")
+
+    # What happened after each historical match
+    console.print()
+    _display_scan_forward_returns(df, results, days)
+
+    # Export
+    if export_json:
+        export_data = {
+            "ticker": ticker,
+            "scan_window_days": days,
+            "lookback_days": lookback,
+            "target": {
+                "start": target_df.index[0].isoformat(),
+                "end": target_df.index[-1].isoformat(),
+                "close_start": round(float(target_df["Close"].iloc[0]), 2),
+                "close_end": round(float(target_df["Close"].iloc[-1]), 2),
+            },
+            "matches": [
+                {
+                    "period": r.event_name,
+                    "start_date": r.event_date.isoformat() if r.event_date else None,
+                    "composite_score": round(r.composite_score, 4),
+                    "correlation": round(r.correlation, 4),
+                    "direction_match": round(r.direction_match, 4),
+                    "dtw_distance": round(r.dtw_distance, 4),
+                    "label": r.score_label,
+                }
+                for r in results
+            ],
+        }
+        path = Path(export_json)
+        path.write_text(json.dumps(export_data, indent=2, default=str))
+        console.print(f"[green]✓ Exported to {path}[/green]")
+
+
+def _display_scan_forward_returns(df, results, window_size: int):
+    """Show what happened after each matched historical period."""
+    import pandas as pd
+    from rich.table import Table
+    from rich import box
+
+    table = Table(
+        title="What Happened After Each Match",
+        box=box.ROUNDED,
+        header_style="bold green",
+    )
+    table.add_column("Period", width=28)
+    table.add_column("Score", justify="center", width=8)
+    table.add_column("+5d", justify="right", width=8)
+    table.add_column("+10d", justify="right", width=8)
+    table.add_column("+20d", justify="right", width=8)
+
+    for r in results:
+        if r.event_date is None:
+            continue
+        # Find the end of the matched window in the dataframe
+        match_start_idx = df.index.searchsorted(pd.Timestamp(r.event_date))
+        match_end_idx = match_start_idx + window_size
+
+        fwd = {}
+        for horizon in [5, 10, 20]:
+            fwd_idx = match_end_idx + horizon - 1
+            if match_end_idx < len(df) and fwd_idx < len(df):
+                end_price = df["Close"].iloc[match_end_idx - 1]
+                fwd_price = df["Close"].iloc[fwd_idx]
+                fwd[horizon] = (fwd_price / end_price - 1) * 100
+            else:
+                fwd[horizon] = None
+
+        def _fmt(val):
+            if val is None:
+                return "[dim]—[/dim]"
+            color = "green" if val > 0 else "red"
+            return f"[{color}]{val:+.2f}%[/{color}]"
+
+        table.add_row(
+            r.event_name[:28],
+            f"{r.composite_score:.3f}",
+            _fmt(fwd[5]),
+            _fmt(fwd[10]),
+            _fmt(fwd[20]),
+        )
+
+    console.print(table)
 
 
 # ── EVENTS command ──────────────────────────────────────────────────────────────

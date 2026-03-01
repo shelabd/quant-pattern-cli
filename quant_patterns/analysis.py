@@ -351,6 +351,96 @@ def build_pattern_profile(
     )
 
 
+# ── Sliding Window Scan ───────────────────────────────────────────────────────
+
+
+def sliding_window_scan(
+    df: pd.DataFrame,
+    window_size: int,
+    step: int = 1,
+    top_n: int = 10,
+    min_gap: int = 0,
+) -> list[SimilarityResult]:
+    """
+    Scan historical data with a sliding window to find periods most similar
+    to the most recent `window_size` trading days.
+
+    Args:
+        df: Full OHLCV DataFrame (must have Close column, DatetimeIndex).
+        window_size: Number of trading days in each comparison window.
+        step: Slide step in trading days (1 = every day, 5 = weekly).
+        top_n: Number of top matches to return.
+        min_gap: Minimum trading days between target and historical windows
+                 to avoid near-duplicate matches (default: 0 = no gap beyond
+                 the target window itself).
+
+    Returns:
+        Top N SimilarityResult objects sorted by composite_score descending.
+    """
+    if len(df) < window_size * 2:
+        logger.warning("Not enough data for sliding window scan")
+        return []
+
+    close = df["Close"].values
+    dates = df.index
+
+    # Target = last window_size days
+    target_start = len(df) - window_size
+    target_close = close[target_start:]
+    target_ref = target_close[0]
+    if target_ref == 0:
+        return []
+    target_norm = ((target_close / target_ref) - 1) * 100
+
+    # Build target DataFrame for compare_windows
+    target_df = df.iloc[target_start:].copy()
+    target_df["rel_day"] = range(window_size)
+    target_df["Close_norm"] = target_norm
+
+    results: list[SimilarityResult] = []
+    scan_end = target_start - min_gap
+
+    for i in range(0, scan_end - window_size + 1, step):
+        hist_close = close[i : i + window_size]
+        hist_ref = hist_close[0]
+        if hist_ref == 0:
+            continue
+        hist_norm = ((hist_close / hist_ref) - 1) * 100
+
+        hist_df = df.iloc[i : i + window_size].copy()
+        hist_df["rel_day"] = range(window_size)
+        hist_df["Close_norm"] = hist_norm
+
+        start_date = dates[i].date() if hasattr(dates[i], "date") else dates[i]
+        end_date = dates[i + window_size - 1].date() if hasattr(dates[i + window_size - 1], "date") else dates[i + window_size - 1]
+        label = f"{start_date} → {end_date}"
+
+        result = compare_windows(target_df, hist_df, event_name=label, event_date=start_date)
+        result.window_data = hist_df
+        results.append(result)
+
+    results.sort(key=lambda r: r.composite_score, reverse=True)
+
+    # Deduplicate overlapping windows: keep highest score per cluster
+    if results:
+        filtered = [results[0]]
+        for r in results[1:]:
+            too_close = False
+            for kept in filtered:
+                if kept.event_date and r.event_date:
+                    gap = abs((kept.event_date - r.event_date).days)
+                    if gap < window_size:
+                        too_close = True
+                        break
+            if not too_close:
+                filtered.append(r)
+            if len(filtered) >= top_n:
+                break
+        results = filtered
+
+    return results[:top_n]
+
+
 # ── Quant Agent Export ──────────────────────────────────────────────────────────
 
 def export_for_agent(

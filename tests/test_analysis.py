@@ -15,6 +15,7 @@ from quant_patterns.analysis import (
     compare_windows,
     export_for_agent,
     find_support_resistance,
+    sliding_window_scan,
 )
 from quant_patterns.data import normalize_window
 
@@ -281,3 +282,89 @@ class TestExportForAgent:
         profile = build_pattern_profile("SPY", "fomc", windows, results)
         export = export_for_agent(profile, [], windows[0])
         assert export["signal"]["direction"] == "bullish"
+
+
+# ── sliding_window_scan ───────────────────────────────────────────────────────
+
+
+class TestSlidingWindowScan:
+    def _make_long_df(self, n=200, seed=42):
+        dates = pd.bdate_range("2023-01-02", periods=n)
+        np.random.seed(seed)
+        close = 100 + np.cumsum(np.random.normal(0, 1, n))
+        return pd.DataFrame(
+            {
+                "Open": close - 0.5,
+                "High": close + 1.0,
+                "Low": close - 1.0,
+                "Close": close,
+                "Volume": np.random.randint(1_000_000, 5_000_000, n),
+            },
+            index=dates,
+        )
+
+    def test_returns_results(self):
+        df = self._make_long_df(200)
+        results = sliding_window_scan(df, window_size=10, top_n=5)
+        assert len(results) > 0
+        assert len(results) <= 5
+
+    def test_results_are_sorted_by_score(self):
+        df = self._make_long_df(200)
+        results = sliding_window_scan(df, window_size=10, top_n=10)
+        scores = [r.composite_score for r in results]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_results_are_similarity_results(self):
+        df = self._make_long_df(200)
+        results = sliding_window_scan(df, window_size=10, top_n=3)
+        for r in results:
+            assert isinstance(r, SimilarityResult)
+            assert r.event_name  # should have a date range label
+            assert r.event_date is not None
+            assert r.composite_score > 0
+
+    def test_step_reduces_results(self):
+        df = self._make_long_df(200)
+        r1 = sliding_window_scan(df, window_size=10, step=1, top_n=50)
+        r5 = sliding_window_scan(df, window_size=10, step=5, top_n=50)
+        # Step=5 examines fewer windows, may find fewer unique matches
+        assert len(r5) <= len(r1)
+
+    def test_too_short_data(self):
+        df = self._make_long_df(10)
+        results = sliding_window_scan(df, window_size=10)
+        assert results == []
+
+    def test_no_overlap_with_target(self):
+        """Historical matches should not overlap with the target window."""
+        df = self._make_long_df(200)
+        window_size = 10
+        results = sliding_window_scan(df, window_size=window_size, top_n=20)
+        target_start = df.index[-window_size].date()
+        for r in results:
+            assert r.event_date < target_start
+
+    def test_deduplication(self):
+        """Matches should be spaced apart (no overlapping windows)."""
+        df = self._make_long_df(300)
+        window_size = 10
+        results = sliding_window_scan(df, window_size=window_size, top_n=10)
+        for i, r1 in enumerate(results):
+            for r2 in results[i + 1:]:
+                gap = abs((r1.event_date - r2.event_date).days)
+                assert gap >= window_size
+
+    def test_top_n_respected(self):
+        df = self._make_long_df(200)
+        for n in [1, 3, 7]:
+            results = sliding_window_scan(df, window_size=10, top_n=n)
+            assert len(results) <= n
+
+    def test_window_data_attached(self):
+        df = self._make_long_df(200)
+        results = sliding_window_scan(df, window_size=10, top_n=3)
+        for r in results:
+            assert r.window_data is not None
+            assert "Close_norm" in r.window_data.columns
+            assert len(r.window_data) == 10
