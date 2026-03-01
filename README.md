@@ -1,6 +1,6 @@
 # ⚡ Quant Pattern CLI (`qpat`)
 
-Historical price pattern analysis around key market events. Find how tickers behave around CPI, FOMC, earnings, elections, geopolitical events, and more — then compare current behavior to historical patterns. Or skip events entirely and scan all of history for similar price action.
+Historical price pattern analysis around key market events. Find how tickers behave around CPI, FOMC, earnings, elections, geopolitical events, crypto events, and more — then compare current behavior to historical patterns. Or skip events entirely and scan all of history for similar price action.
 
 Built to feed a downstream quant agent for informed trading decisions.
 
@@ -18,6 +18,9 @@ qpat analyze NVDA -e earnings -b 5 -a 15
 
 # Analyze SPY price action around NVDA earnings
 qpat analyze SPY -e earnings --event-ticker NVDA -b 5 -a 15
+
+# Analyze BTC around major crypto events (FTX, Luna, ETF approvals, etc.)
+qpat analyze BTC-USD -e crypto -b 10 -a 180
 
 # Scan history for similar price action (no events needed)
 qpat scan SPY --days 10 --lookback 1000
@@ -42,7 +45,7 @@ Full pattern analysis: fetches historical events, compares price behavior around
 
 | Flag | Description |
 |------|-------------|
-| `-e` | Event type: `cpi`, `ppi`, `fomc`, `nfp`, `earnings`, `election`, `geopolitical`, `gdp`, `retail_sales`, `opec`, `custom` |
+| `-e` | Event type: `cpi`, `ppi`, `fomc`, `nfp`, `earnings`, `election`, `geopolitical`, `gdp`, `retail_sales`, `opec`, `crypto`, `custom` |
 | `-b` | Trading days before event (default: 10) |
 | `-a` | Trading days after event (default: 10) |
 | `-t` | Target date to compare (default: today) |
@@ -92,7 +95,7 @@ Guided analysis with prompts for each parameter.
 quant_patterns/
 ├── cli.py        # Click CLI with all commands
 ├── data.py       # Data providers (yfinance, IBKR stub)
-├── events.py     # Event catalog (60+ built-in events)
+├── events.py     # Event catalog (80+ built-in events)
 ├── analysis.py   # Pattern matching, S/R, similarity scoring
 └── display.py    # Rich terminal output (charts, tables, sparklines)
 ```
