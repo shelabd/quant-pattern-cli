@@ -905,7 +905,7 @@ def interactive(provider, verbose):
             progress.advance(task)
 
     if similarity_results:
-        display_similarity_results(similarity_results, top_n=5)
+        display_similarity_results(similarity_results, top_n=len(similarity_results))
         top = sorted(similarity_results, key=lambda s: s.composite_score, reverse=True)
         display_comparison_chart(target_norm, top, max_overlays=3)
 

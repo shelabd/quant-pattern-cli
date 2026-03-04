@@ -274,9 +274,12 @@ def display_support_resistance(levels: list[Level], current_price: Optional[floa
 
 
 def display_similarity_results(results: list[SimilarityResult], top_n: int = 10):
-    """Display ranked similarity results."""
+    """Display ranked similarity results sorted by score descending."""
+    sorted_results = sorted(results, key=lambda s: s.composite_score, reverse=True)
+    show_n = min(top_n, len(sorted_results))
+    title = f"All {show_n} Pattern Matches (by score)" if show_n == len(sorted_results) else f"Top {show_n} Pattern Matches"
     table = Table(
-        title=f"Top {min(top_n, len(results))} Pattern Matches",
+        title=title,
         box=box.ROUNDED,
         header_style="bold blue",
     )
@@ -290,7 +293,7 @@ def display_similarity_results(results: list[SimilarityResult], top_n: int = 10)
     table.add_column("DTW", justify="right", width=8)
     table.add_column("Sparkline", width=25)
 
-    for i, r in enumerate(results[:top_n], 1):
+    for i, r in enumerate(sorted_results[:show_n], 1):
         score_color = _score_color(r.composite_score)
         spark = ""
         if r.window_data is not None and "Close_norm" in r.window_data.columns:
