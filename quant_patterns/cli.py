@@ -849,29 +849,29 @@ def interactive(provider, verbose):
         return
 
     console.print()
-    display_event_list(all_events)
+    for i, e in enumerate(all_events, 1):
+        console.print(f"  [cyan]{i:>3}[/cyan]) {e.name} ({e.date}) [dim]{e.description[:40]}[/dim]")
     console.print()
 
-    compare_mode = Prompt.ask(
-        "[bold]Compare against all events or a specific one?",
-        choices=["all", "specific"],
+    event_choice = Prompt.ask(
+        "[bold]Enter event # to compare against one, or 'all'",
         default="all",
     )
 
-    if compare_mode == "specific":
-        console.print()
-        for i, e in enumerate(all_events, 1):
-            console.print(f"  [cyan]{i}[/cyan]) {e.name} ({e.date})")
-        console.print()
-        choice = IntPrompt.ask(
-            f"[bold]Select event (1-{len(all_events)})",
-            default=1,
-        )
-        choice = max(1, min(len(all_events), choice))
-        events_list = [all_events[choice - 1]]
-        console.print(f"\n  Selected: [bold]{events_list[0].name}[/bold] ({events_list[0].date})")
-    else:
+    if event_choice.strip().lower() == "all":
         events_list = all_events
+    else:
+        try:
+            idx = int(event_choice)
+            if 1 <= idx <= len(all_events):
+                events_list = [all_events[idx - 1]]
+                console.print(f"\n  Selected: [bold]{events_list[0].name}[/bold] ({events_list[0].date})")
+            else:
+                console.print(f"[yellow]Invalid choice, using all events[/yellow]")
+                events_list = all_events
+        except ValueError:
+            console.print(f"[yellow]Invalid input, using all events[/yellow]")
+            events_list = all_events
 
     # Run analysis
     console.print(f"\n[bold cyan]Running analysis: {ticker} × {category.value.upper()}...[/bold cyan]\n")
