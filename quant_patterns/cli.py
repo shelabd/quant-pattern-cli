@@ -842,15 +842,39 @@ def interactive(provider, verbose):
     target_str = Prompt.ask("[bold]Target date (YYYY-MM-DD or 'today')", default="today")
     t_date = date.today() if target_str == "today" else datetime.strptime(target_str, "%Y-%m-%d").date()
 
-    # Run analysis
-    console.print(f"\n[bold cyan]Running analysis: {ticker} × {category.value.upper()}...[/bold cyan]\n")
-
-    events_list = catalog.search(category=category, ticker=ticker)
-    if not events_list:
+    # Step 5: Specific event or all?
+    all_events = catalog.search(category=category, ticker=ticker)
+    if not all_events:
         console.print(f"[red]No events found for {category.value} + {ticker}[/red]")
         return
 
-    display_event_list(events_list)
+    console.print()
+    display_event_list(all_events)
+    console.print()
+
+    compare_mode = Prompt.ask(
+        "[bold]Compare against all events or a specific one?",
+        choices=["all", "specific"],
+        default="all",
+    )
+
+    if compare_mode == "specific":
+        console.print()
+        for i, e in enumerate(all_events, 1):
+            console.print(f"  [cyan]{i}[/cyan]) {e.name} ({e.date})")
+        console.print()
+        choice = IntPrompt.ask(
+            f"[bold]Select event (1-{len(all_events)})",
+            default=1,
+        )
+        choice = max(1, min(len(all_events), choice))
+        events_list = [all_events[choice - 1]]
+        console.print(f"\n  Selected: [bold]{events_list[0].name}[/bold] ({events_list[0].date})")
+    else:
+        events_list = all_events
+
+    # Run analysis
+    console.print(f"\n[bold cyan]Running analysis: {ticker} × {category.value.upper()}...[/bold cyan]\n")
 
     try:
         target_window = fetch_event_window(dp, ticker, t_date, days_before, days_after)
