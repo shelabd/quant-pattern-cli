@@ -45,6 +45,7 @@ from .display import (
     display_comparison_chart,
     display_event_list,
     display_pattern_profile,
+    display_scan_forecast,
     display_similarity_results,
     display_support_resistance,
     display_ticker_info,
@@ -440,6 +441,10 @@ def scan(ticker, days, lookback, step, top_n, export_json, provider, verbose):
     console.print()
     _display_scan_forward_returns(df, results, days)
 
+    # Day-by-day forecast based on top matches
+    console.print()
+    _display_forecast(df, results, days, ticker)
+
     # Export
     if export_json:
         export_data = {
@@ -519,6 +524,61 @@ def _display_scan_forward_returns(df, results, window_size: int):
         )
 
     console.print(table)
+
+
+def _display_forecast(df, results, window_size: int, ticker: str):
+    """Build a weighted day-by-day price forecast from top matches' forward returns."""
+    import pandas as pd
+
+    current_price = float(df["Close"].iloc[-1])
+
+    # Collect forward daily returns for each match, weighted by composite score
+    forward_returns_by_day: dict[int, list[tuple[float, float]]] = {}  # day -> [(return, weight)]
+
+    for r in results:
+        if r.event_date is None:
+            continue
+        match_start_idx = df.index.searchsorted(pd.Timestamp(r.event_date))
+        match_end_idx = match_start_idx + window_size
+
+        if match_end_idx >= len(df):
+            continue
+
+        end_price = float(df["Close"].iloc[match_end_idx - 1])
+        weight = r.composite_score
+
+        prev_price = end_price
+        for d in range(1, window_size + 1):
+            fwd_idx = match_end_idx + d - 1
+            if fwd_idx >= len(df):
+                break
+            fwd_price = float(df["Close"].iloc[fwd_idx])
+            daily_ret = (fwd_price / prev_price - 1) * 100
+            forward_returns_by_day.setdefault(d, []).append((daily_ret, weight))
+            prev_price = fwd_price
+
+    if not forward_returns_by_day:
+        return
+
+    # Build forecast: weighted average return per day, applied sequentially
+    forecast = []
+    projected = current_price
+    for day in sorted(forward_returns_by_day.keys()):
+        entries = forward_returns_by_day[day]
+        total_weight = sum(w for _, w in entries)
+        if total_weight == 0:
+            break
+        avg_ret = sum(r * w for r, w in entries) / total_weight
+        projected = projected * (1 + avg_ret / 100)
+        forecast.append({
+            "day": day,
+            "price": projected,
+            "change_pct": avg_ret,
+            "contributors": len(entries),
+        })
+
+    if forecast:
+        display_scan_forecast(forecast, ticker, current_price)
 
 
 # ── EVENTS command ──────────────────────────────────────────────────────────────

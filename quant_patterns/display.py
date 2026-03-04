@@ -431,6 +431,69 @@ def display_comparison_chart(
     console.print(Panel("\n".join(lines), border_style="blue"))
 
 
+def display_scan_forecast(forecast: list[dict], ticker: str, current_price: float):
+    """
+    Display a day-by-day price forecast table.
+
+    Each entry in forecast: {day, price, change_pct, contributors}
+    """
+    table = Table(
+        title=f"Price Forecast — {ticker} (based on top historical matches)",
+        box=box.ROUNDED,
+        header_style="bold magenta",
+    )
+    table.add_column("Day", justify="center", width=5)
+    table.add_column("Projected Price", justify="right", width=16)
+    table.add_column("Change", justify="right", width=10)
+    table.add_column("Cumulative", justify="right", width=10)
+    table.add_column("Trend", width=30)
+
+    cum_pct = 0.0
+    prices = []
+    for entry in forecast:
+        day = entry["day"]
+        price = entry["price"]
+        change_pct = entry["change_pct"]
+        cum_pct = ((price / current_price) - 1) * 100
+
+        prices.append(price)
+        color = "green" if change_pct >= 0 else "red"
+        cum_color = "green" if cum_pct >= 0 else "red"
+
+        # Mini trend bar
+        bar_len = min(20, int(abs(cum_pct) * 4))
+        if cum_pct >= 0:
+            trend = f"[green]{'▓' * bar_len}{'░' * (20 - bar_len)}[/green]"
+        else:
+            trend = f"[red]{'▓' * bar_len}{'░' * (20 - bar_len)}[/red]"
+
+        table.add_row(
+            f"+{day}",
+            f"${price:.2f}",
+            Text(f"{change_pct:+.2f}%", style=color),
+            Text(f"{cum_pct:+.2f}%", style=cum_color),
+            trend,
+        )
+
+    console.print(table)
+
+    # Summary line
+    if prices:
+        final = prices[-1]
+        total_pct = ((final / current_price) - 1) * 100
+        direction = "higher" if total_pct > 0 else "lower"
+        dir_color = "green" if total_pct > 0 else "red"
+        console.print(
+            f"\n  [bold]Projection:[/bold] ${current_price:.2f} → "
+            f"[{dir_color}]${final:.2f} ({total_pct:+.2f}% {direction})[/{dir_color}] "
+            f"over {len(prices)} trading days"
+        )
+        console.print(
+            "  [dim]Based on weighted average of top matches' forward returns. "
+            "Past patterns do not guarantee future results.[/dim]\n"
+        )
+
+
 def display_agent_export(data: dict):
     """Display the JSON export preview for quant agent."""
     import json
