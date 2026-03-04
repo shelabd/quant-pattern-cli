@@ -223,6 +223,11 @@ def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
     profile = build_pattern_profile(ticker, event_type, windows, similarity_results)
     display_pattern_profile(profile)
 
+    # Day-by-day forecast
+    console.print()
+    current_price = float(target_window["Close"].iloc[-1])
+    _build_event_forecast(similarity_results, current_price, ticker)
+
     # Export
     if export_json:
         export_data = export_for_agent(profile, sr_levels, target_window)
@@ -526,6 +531,51 @@ def _display_scan_forward_returns(df, results, window_size: int):
     console.print(table)
 
 
+def _build_event_forecast(similarity_results, current_price, ticker):
+    """Build a day-by-day forecast from event-based matches' post-event returns."""
+    top = sorted(similarity_results, key=lambda s: s.composite_score, reverse=True)[:5]
+
+    forward_returns_by_day: dict[int, list[tuple[float, float]]] = {}
+
+    for r in top:
+        wd = r.window_data
+        if wd is None or "rel_day" not in wd.columns or "Close" not in wd.columns:
+            continue
+
+        post = wd[wd["rel_day"] >= 0].sort_values("rel_day")
+        if len(post) < 2:
+            continue
+
+        weight = r.composite_score
+        closes = post["Close"].values
+
+        for i in range(1, len(closes)):
+            daily_ret = (closes[i] / closes[i - 1] - 1) * 100
+            forward_returns_by_day.setdefault(i, []).append((daily_ret, weight))
+
+    if not forward_returns_by_day:
+        return
+
+    forecast = []
+    projected = current_price
+    for day in sorted(forward_returns_by_day.keys()):
+        entries = forward_returns_by_day[day]
+        total_weight = sum(w for _, w in entries)
+        if total_weight == 0:
+            break
+        avg_ret = sum(ret * w for ret, w in entries) / total_weight
+        projected = projected * (1 + avg_ret / 100)
+        forecast.append({
+            "day": day,
+            "price": projected,
+            "change_pct": avg_ret,
+            "contributors": len(entries),
+        })
+
+    if forecast:
+        display_scan_forecast(forecast, ticker, current_price)
+
+
 def _display_forecast(df, results, window_size: int, ticker: str):
     """Build a weighted day-by-day price forecast from top matches' forward returns."""
     import pandas as pd
@@ -699,6 +749,13 @@ def export(ticker, event_type, output, days_before, days_after, event_ticker, pr
     sr_levels = find_support_resistance(broad_df)
 
     profile = build_pattern_profile(ticker, event_type, windows, similarity_results)
+
+    # Day-by-day forecast
+    if similarity_results:
+        console.print()
+        current_price = float(target_window["Close"].iloc[-1])
+        _build_event_forecast(similarity_results, current_price, ticker)
+
     export_data = export_for_agent(profile, sr_levels, target_window)
 
     path = Path(output)
@@ -794,6 +851,11 @@ def interactive(provider, verbose):
     if windows and similarity_results:
         profile = build_pattern_profile(ticker, cat_choice, windows, similarity_results)
         display_pattern_profile(profile)
+
+        # Day-by-day forecast
+        console.print()
+        current_price = float(target_window["Close"].iloc[-1])
+        _build_event_forecast(similarity_results, current_price, ticker)
 
     # Export option
     if Prompt.ask("\n[bold]Export to JSON?", choices=["y", "n"], default="n") == "y":
