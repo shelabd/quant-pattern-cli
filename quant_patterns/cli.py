@@ -235,7 +235,8 @@ def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
     # Day-by-day forecast
     console.print()
     current_price = float(target_window["Close"].iloc[-1])
-    _build_event_forecast(similarity_results, current_price, ticker)
+    _build_event_forecast(similarity_results, current_price, ticker,
+                          start_date=target_window.index[-1].date())
 
     # Export
     if export_json:
@@ -567,7 +568,7 @@ def _display_scan_forward_returns(df, results, window_size: int):
     console.print(table)
 
 
-def _build_event_forecast(similarity_results, current_price, ticker):
+def _build_event_forecast(similarity_results, current_price, ticker, start_date=None):
     """Build a day-by-day forecast from event-based matches' post-event returns."""
     top = sorted(similarity_results, key=lambda s: s.composite_score, reverse=True)[:5]
 
@@ -609,7 +610,7 @@ def _build_event_forecast(similarity_results, current_price, ticker):
         })
 
     if forecast:
-        display_scan_forecast(forecast, ticker, current_price)
+        display_scan_forecast(forecast, ticker, current_price, start_date=start_date)
 
 
 def _display_forecast(df, results, window_size: int, ticker: str):
@@ -664,7 +665,8 @@ def _display_forecast(df, results, window_size: int, ticker: str):
         })
 
     if forecast:
-        display_scan_forecast(forecast, ticker, current_price)
+        last_date = df.index[-1].date() if hasattr(df.index[-1], "date") else df.index[-1]
+        display_scan_forecast(forecast, ticker, current_price, start_date=last_date)
 
 
 # ── EVENTS command ──────────────────────────────────────────────────────────────
@@ -796,7 +798,8 @@ def export(ticker, event_type, output, days_before, days_after, event_ticker, pr
     if similarity_results:
         console.print()
         current_price = float(target_window["Close"].iloc[-1])
-        _build_event_forecast(similarity_results, current_price, ticker)
+        _build_event_forecast(similarity_results, current_price, ticker,
+                          start_date=target_window.index[-1].date())
 
     export_data = export_for_agent(profile, sr_levels, target_window, volume_price=vp_profile)
 
@@ -928,7 +931,8 @@ def interactive(provider, verbose):
         # Day-by-day forecast
         console.print()
         current_price = float(target_window["Close"].iloc[-1])
-        _build_event_forecast(similarity_results, current_price, ticker)
+        _build_event_forecast(similarity_results, current_price, ticker,
+                          start_date=target_window.index[-1].date())
 
     # Export option
     if Prompt.ask("\n[bold]Export to JSON?", choices=["y", "n"], default="n") == "y":

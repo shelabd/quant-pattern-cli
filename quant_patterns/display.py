@@ -6,7 +6,7 @@ ASCII price charts, colored tables, sparklines, and formatted output.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 
 import numpy as np
@@ -431,18 +431,34 @@ def display_comparison_chart(
     console.print(Panel("\n".join(lines), border_style="blue"))
 
 
-def display_scan_forecast(forecast: list[dict], ticker: str, current_price: float):
+def _next_trading_day(d: date, n: int) -> date:
+    """Advance n trading days from date d (skip weekends)."""
+    current = d
+    days_added = 0
+    while days_added < n:
+        current += timedelta(days=1)
+        if current.weekday() < 5:  # Mon-Fri
+            days_added += 1
+    return current
+
+
+def display_scan_forecast(forecast: list[dict], ticker: str, current_price: float,
+                          start_date: Optional[date] = None):
     """
     Display a day-by-day price forecast table.
 
     Each entry in forecast: {day, price, change_pct, contributors}
     """
+    if start_date is None:
+        start_date = date.today()
+
     table = Table(
         title=f"Price Forecast — {ticker} (based on top historical matches)",
         box=box.ROUNDED,
         header_style="bold magenta",
     )
     table.add_column("Day", justify="center", width=5)
+    table.add_column("Date", width=12)
     table.add_column("Projected Price", justify="right", width=16)
     table.add_column("Change", justify="right", width=10)
     table.add_column("Cumulative", justify="right", width=10)
@@ -455,6 +471,7 @@ def display_scan_forecast(forecast: list[dict], ticker: str, current_price: floa
         price = entry["price"]
         change_pct = entry["change_pct"]
         cum_pct = ((price / current_price) - 1) * 100
+        forecast_date = _next_trading_day(start_date, day)
 
         prices.append(price)
         color = "green" if change_pct >= 0 else "red"
@@ -469,6 +486,7 @@ def display_scan_forecast(forecast: list[dict], ticker: str, current_price: floa
 
         table.add_row(
             f"+{day}",
+            forecast_date.strftime("%Y-%m-%d"),
             f"${price:.2f}",
             Text(f"{change_pct:+.2f}%", style=color),
             Text(f"{cum_pct:+.2f}%", style=cum_color),
