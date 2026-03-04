@@ -441,12 +441,194 @@ def sliding_window_scan(
     return results[:top_n]
 
 
+# ── Volume-Price Authenticity ──────────────────────────────────────────────────
+
+@dataclass
+class VolumePriceDay:
+    """Per-day volume-price metrics."""
+    rel_day: int
+    date: date
+    price_change_pct: float
+    relative_volume: float  # RVOL = day_vol / 20-day rolling avg
+    move_efficiency: float  # abs(price_chg%) / RVOL
+    classification: str     # organic/synthetic/accumulation/distribution/neutral
+    volume_confirms_price: bool
+
+
+@dataclass
+class VolumePriceProfile:
+    """Aggregate volume-price authenticity assessment."""
+    ticker: str
+    window_start: date
+    window_end: date
+    num_days: int
+    volume_confirmation_pct: float  # % of days where volume confirms price direction
+    authenticity_score: float       # 0-1 weighted composite
+    classification: str             # Organic, Likely Synthetic, etc.
+    avg_relative_volume: float
+    high_volume_days: int
+    low_volume_days: int
+    daily_metrics: list[VolumePriceDay] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "ticker": self.ticker,
+            "window_start": self.window_start.isoformat(),
+            "window_end": self.window_end.isoformat(),
+            "num_days": self.num_days,
+            "volume_confirmation_pct": round(self.volume_confirmation_pct, 1),
+            "authenticity_score": round(self.authenticity_score, 3),
+            "classification": self.classification,
+            "avg_relative_volume": round(self.avg_relative_volume, 2),
+            "high_volume_days": self.high_volume_days,
+            "low_volume_days": self.low_volume_days,
+        }
+
+
+def analyze_volume_price(
+    df: pd.DataFrame,
+    lookback_avg: int = 20,
+    report_last_n: Optional[int] = None,
+) -> Optional[VolumePriceProfile]:
+    """
+    Analyze volume-price relationship to classify moves as organic vs synthetic.
+
+    Args:
+        df: OHLCV DataFrame with Close and Volume columns.
+        lookback_avg: Rolling window for average volume baseline.
+        report_last_n: If set, compute rolling avg on full df but only report
+                       last N days (useful for scan command).
+    """
+    if df.empty or "Volume" not in df.columns or "Close" not in df.columns:
+        return None
+    if len(df) < 3:
+        return None
+
+    # Compute rolling average volume on full df
+    df = df.copy()
+    df["_vol_avg"] = df["Volume"].rolling(lookback_avg, min_periods=1).mean()
+    df["_price_chg"] = df["Close"].pct_change() * 100
+
+    # Determine reporting slice
+    if report_last_n and report_last_n < len(df):
+        report_df = df.iloc[-report_last_n:]
+    else:
+        report_df = df.iloc[1:]  # skip first row (no price change)
+
+    daily_metrics: list[VolumePriceDay] = []
+    for idx, row in report_df.iterrows():
+        vol = row["Volume"]
+        vol_avg = row["_vol_avg"]
+        price_chg = row["_price_chg"]
+
+        if pd.isna(price_chg) or pd.isna(vol_avg) or vol_avg == 0:
+            continue
+
+        rvol = vol / vol_avg
+        efficiency = abs(price_chg) / rvol if rvol > 0 else 0.0
+        abs_chg = abs(price_chg)
+
+        # Classification logic
+        large_move = abs_chg > 0.5
+        small_move = abs_chg <= 0.5
+
+        if large_move and rvol > 1.2:
+            classification = "organic"
+        elif large_move and rvol < 0.5:
+            classification = "synthetic"
+        elif small_move and rvol > 1.5 and price_chg >= 0:
+            classification = "accumulation"
+        elif small_move and rvol > 1.5 and price_chg < 0:
+            classification = "distribution"
+        else:
+            classification = "neutral"
+
+        # Volume confirms price: high volume on moves, low volume on small days
+        if large_move:
+            confirms = rvol > 0.8
+        else:
+            confirms = rvol <= 1.5
+
+        dt = idx.date() if hasattr(idx, "date") else idx
+        rel_day_val = int(row["rel_day"]) if "rel_day" in df.columns else 0
+
+        daily_metrics.append(VolumePriceDay(
+            rel_day=rel_day_val,
+            date=dt,
+            price_change_pct=round(price_chg, 3),
+            relative_volume=round(rvol, 2),
+            move_efficiency=round(efficiency, 3),
+            classification=classification,
+            volume_confirms_price=confirms,
+        ))
+
+    if not daily_metrics:
+        return None
+
+    # Aggregate
+    num_confirms = sum(1 for d in daily_metrics if d.volume_confirms_price)
+    confirmation_pct = (num_confirms / len(daily_metrics)) * 100
+
+    avg_rvol = np.mean([d.relative_volume for d in daily_metrics])
+    high_vol = sum(1 for d in daily_metrics if d.relative_volume > 1.2)
+    low_vol = sum(1 for d in daily_metrics if d.relative_volume < 0.8)
+    organic_count = sum(1 for d in daily_metrics if d.classification == "organic")
+    organic_ratio = organic_count / len(daily_metrics)
+    avg_efficiency = np.mean([d.move_efficiency for d in daily_metrics])
+
+    # Authenticity score: weighted composite
+    conf_norm = min(1.0, confirmation_pct / 100)
+    rvol_norm = min(1.0, avg_rvol / 2.0)  # cap at 2x average
+    eff_norm = min(1.0, avg_efficiency / 5.0)  # normalize efficiency
+
+    authenticity = (
+        0.35 * conf_norm
+        + 0.25 * rvol_norm
+        + 0.20 * eff_norm
+        + 0.20 * organic_ratio
+    )
+
+    # Overall classification
+    synthetic_count = sum(1 for d in daily_metrics if d.classification == "synthetic")
+    accum_count = sum(1 for d in daily_metrics if d.classification == "accumulation")
+    distrib_count = sum(1 for d in daily_metrics if d.classification == "distribution")
+
+    if organic_ratio > 0.4 and authenticity > 0.5:
+        overall = "Organic"
+    elif synthetic_count > organic_count and authenticity < 0.4:
+        overall = "Likely Synthetic"
+    elif accum_count > organic_count and accum_count > synthetic_count:
+        overall = "Accumulation Phase"
+    elif distrib_count > organic_count and distrib_count > synthetic_count:
+        overall = "Distribution Phase"
+    else:
+        overall = "Mixed"
+
+    start_dt = daily_metrics[0].date
+    end_dt = daily_metrics[-1].date
+
+    return VolumePriceProfile(
+        ticker=df.attrs.get("ticker", ""),
+        window_start=start_dt,
+        window_end=end_dt,
+        num_days=len(daily_metrics),
+        volume_confirmation_pct=round(confirmation_pct, 1),
+        authenticity_score=round(authenticity, 3),
+        classification=overall,
+        avg_relative_volume=round(float(avg_rvol), 2),
+        high_volume_days=high_vol,
+        low_volume_days=low_vol,
+        daily_metrics=daily_metrics,
+    )
+
+
 # ── Quant Agent Export ──────────────────────────────────────────────────────────
 
 def export_for_agent(
     profile: PatternProfile,
     support_resistance: list[Level],
     target_window: pd.DataFrame,
+    volume_price: Optional[VolumePriceProfile] = None,
 ) -> dict:
     """
     Export analysis results in a structured format for downstream quant agent consumption.
@@ -491,4 +673,5 @@ def export_for_agent(
                             else (100 - profile.positive_after_pct) / 100),
             "historical_edge_pct": round(profile.avg_return_after, 3),
         },
+        "volume_price_authenticity": volume_price.to_dict() if volume_price else None,
     }

@@ -24,6 +24,7 @@ from rich.prompt import Prompt, IntPrompt
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from .analysis import (
+    analyze_volume_price,
     build_pattern_profile,
     compare_windows,
     export_for_agent,
@@ -49,6 +50,7 @@ from .display import (
     display_similarity_results,
     display_support_resistance,
     display_ticker_info,
+    display_volume_price_profile,
 )
 from .events import EventCatalog, EventCategory, MarketEvent
 
@@ -219,6 +221,13 @@ def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
         logger.warning(f"S/R analysis error: {e}")
         sr_levels = []
 
+    # Volume-Price Authenticity
+    console.print()
+    vp_profile = analyze_volume_price(target_window)
+    if vp_profile:
+        vp_profile.ticker = ticker
+        display_volume_price_profile(vp_profile, show_daily=True)
+
     # Build and display profile
     profile = build_pattern_profile(ticker, event_type, windows, similarity_results)
     display_pattern_profile(profile)
@@ -230,7 +239,7 @@ def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
 
     # Export
     if export_json:
-        export_data = export_for_agent(profile, sr_levels, target_window)
+        export_data = export_for_agent(profile, sr_levels, target_window, volume_price=vp_profile)
         path = Path(export_json)
         path.write_text(json.dumps(export_data, indent=2, default=str))
         console.print(f"\n[green]✓ Exported to {path}[/green]")
@@ -299,6 +308,26 @@ def compare(ticker, current_start, current_end, hist_start, hist_end, provider, 
     console.print(ascii_price_chart(df_current, title=f"Current: {cs} → {ce}"))
     console.print()
     console.print(ascii_price_chart(df_hist, title=f"Historical: {hs} → {he}"))
+
+    # Volume-Price Authenticity for both periods
+    console.print()
+    try:
+        # Fetch extra 40 calendar days before each period for RVOL baseline
+        df_curr_broad = dp.get_daily_ohlcv(ticker, cs - timedelta(days=40), ce)
+        vp_current = analyze_volume_price(df_curr_broad, report_last_n=len(df_current))
+        if vp_current:
+            vp_current.ticker = ticker
+            console.print(f"  [bold]Current Period ({cs} → {ce}):[/bold]")
+            display_volume_price_profile(vp_current, show_daily=True)
+
+        df_hist_broad = dp.get_daily_ohlcv(ticker, hs - timedelta(days=40), he)
+        vp_hist = analyze_volume_price(df_hist_broad, report_last_n=len(df_hist))
+        if vp_hist:
+            vp_hist.ticker = ticker
+            console.print(f"\n  [bold]Historical Period ({hs} → {he}):[/bold]")
+            display_volume_price_profile(vp_hist, show_daily=True)
+    except Exception as e:
+        logger.warning(f"Volume-price analysis error: {e}")
 
 
 # ── SR command ──────────────────────────────────────────────────────────────────
@@ -445,6 +474,13 @@ def scan(ticker, days, lookback, step, top_n, export_json, provider, verbose):
     # What happened after each historical match
     console.print()
     _display_scan_forward_returns(df, results, days)
+
+    # Volume-Price Authenticity (summary only for scan)
+    console.print()
+    vp_profile = analyze_volume_price(df, report_last_n=days)
+    if vp_profile:
+        vp_profile.ticker = ticker
+        display_volume_price_profile(vp_profile, show_daily=False)
 
     # Day-by-day forecast based on top matches
     console.print()
@@ -750,13 +786,19 @@ def export(ticker, event_type, output, days_before, days_after, event_ticker, pr
 
     profile = build_pattern_profile(ticker, event_type, windows, similarity_results)
 
+    # Volume-Price Authenticity
+    vp_profile = analyze_volume_price(target_window)
+    if vp_profile:
+        vp_profile.ticker = ticker
+        display_volume_price_profile(vp_profile, show_daily=False)
+
     # Day-by-day forecast
     if similarity_results:
         console.print()
         current_price = float(target_window["Close"].iloc[-1])
         _build_event_forecast(similarity_results, current_price, ticker)
 
-    export_data = export_for_agent(profile, sr_levels, target_window)
+    export_data = export_for_agent(profile, sr_levels, target_window, volume_price=vp_profile)
 
     path = Path(output)
     path.write_text(json.dumps(export_data, indent=2, default=str))
@@ -848,6 +890,13 @@ def interactive(provider, verbose):
     except Exception:
         sr_levels = []
 
+    # Volume-Price Authenticity
+    console.print()
+    vp_profile = analyze_volume_price(target_window)
+    if vp_profile:
+        vp_profile.ticker = ticker
+        display_volume_price_profile(vp_profile, show_daily=True)
+
     if windows and similarity_results:
         profile = build_pattern_profile(ticker, cat_choice, windows, similarity_results)
         display_pattern_profile(profile)
@@ -861,7 +910,7 @@ def interactive(provider, verbose):
     if Prompt.ask("\n[bold]Export to JSON?", choices=["y", "n"], default="n") == "y":
         out = Prompt.ask("[bold]Output file", default=f"{ticker.lower()}_{cat_choice}_analysis.json")
         if windows and similarity_results:
-            export_data = export_for_agent(profile, sr_levels, target_window)
+            export_data = export_for_agent(profile, sr_levels, target_window, volume_price=vp_profile)
             Path(out).write_text(json.dumps(export_data, indent=2, default=str))
             console.print(f"[green]✓ Exported to {out}[/green]")
 

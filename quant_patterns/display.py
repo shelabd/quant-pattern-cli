@@ -19,7 +19,7 @@ from rich.columns import Columns
 from rich.rule import Rule
 from rich import box
 
-from .analysis import Level, SimilarityResult, PatternProfile
+from .analysis import Level, SimilarityResult, PatternProfile, VolumePriceProfile
 from .events import MarketEvent, EventCategory, EVENT_CATEGORY_LABELS
 
 console = Console()
@@ -499,6 +499,97 @@ def display_agent_export(data: dict):
     import json
     formatted = json.dumps(data, indent=2, default=str)
     console.print(Panel(formatted, title="[bold green]Agent Export (JSON)[/bold green]", border_style="green"))
+
+
+def display_volume_price_profile(profile: VolumePriceProfile, show_daily: bool = True):
+    """Display volume-price authenticity analysis."""
+    # Color-code authenticity score
+    score = profile.authenticity_score
+    if score >= 0.6:
+        score_color = "bright_green"
+    elif score >= 0.4:
+        score_color = "yellow"
+    else:
+        score_color = "red"
+
+    # Classification color
+    cls_map = {
+        "Organic": "bright_green",
+        "Likely Synthetic": "red",
+        "Accumulation Phase": "yellow",
+        "Distribution Phase": "yellow",
+        "Mixed": "white",
+    }
+    cls_color = cls_map.get(profile.classification, "white")
+
+    # Summary panel
+    summary = Text()
+    summary.append("  Authenticity Score: ", style="bold white")
+    summary.append(f"{score:.3f}", style=f"bold {score_color}")
+    summary.append(f"  |  ", style="dim")
+    summary.append("Classification: ", style="bold white")
+    summary.append(profile.classification, style=f"bold {cls_color}")
+    summary.append(f"\n  Vol Confirmation: ", style="bold white")
+    summary.append(f"{profile.volume_confirmation_pct:.1f}%", style="white")
+    summary.append(f"  |  ", style="dim")
+    summary.append("Avg RVOL: ", style="bold white")
+    rvol_color = "green" if profile.avg_relative_volume > 1.0 else "yellow" if profile.avg_relative_volume > 0.7 else "red"
+    summary.append(f"{profile.avg_relative_volume:.2f}x", style=rvol_color)
+    summary.append(f"  |  ", style="dim")
+    summary.append(f"High Vol Days: ", style="bold white")
+    summary.append(f"{profile.high_volume_days}", style="green")
+    summary.append(f"  |  ", style="dim")
+    summary.append(f"Low Vol Days: ", style="bold white")
+    summary.append(f"{profile.low_volume_days}", style="red")
+
+    console.print(Panel(
+        summary,
+        title="[bold]Volume-Price Authenticity[/bold]",
+        border_style="magenta",
+        padding=(0, 1),
+    ))
+
+    # Per-day table
+    if show_daily and profile.daily_metrics:
+        table = Table(
+            box=box.SIMPLE_HEAVY,
+            header_style="bold magenta",
+            show_lines=False,
+        )
+        table.add_column("Day", justify="center", width=5)
+        table.add_column("Date", width=12)
+        table.add_column("Price Chg", justify="right", width=10)
+        table.add_column("RVOL", justify="right", width=7)
+        table.add_column("Efficiency", justify="right", width=10)
+        table.add_column("Type", width=14)
+        table.add_column("Confirmed", justify="center", width=9)
+
+        type_colors = {
+            "organic": "green",
+            "synthetic": "red",
+            "accumulation": "yellow",
+            "distribution": "yellow",
+            "neutral": "dim",
+        }
+
+        for d in profile.daily_metrics:
+            color = type_colors.get(d.classification, "white")
+            chg_color = "green" if d.price_change_pct >= 0 else "red"
+            rvol_style = "green" if d.relative_volume > 1.2 else "red" if d.relative_volume < 0.5 else "white"
+            confirm_str = Text("Y" if d.volume_confirms_price else "N",
+                               style="green" if d.volume_confirms_price else "red")
+
+            table.add_row(
+                str(d.rel_day),
+                str(d.date),
+                Text(f"{d.price_change_pct:+.2f}%", style=chg_color),
+                Text(f"{d.relative_volume:.2f}x", style=rvol_style),
+                f"{d.move_efficiency:.2f}",
+                Text(d.classification.upper(), style=f"bold {color}"),
+                confirm_str,
+            )
+
+        console.print(table)
 
 
 def display_categories():
