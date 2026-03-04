@@ -33,6 +33,7 @@ from .analysis import (
 from .data import (
     DataProvider,
     fetch_event_window,
+    fetch_ticker_info,
     get_provider,
     normalize_window,
 )
@@ -46,6 +47,7 @@ from .display import (
     display_pattern_profile,
     display_similarity_results,
     display_support_resistance,
+    display_ticker_info,
 )
 from .events import EventCatalog, EventCategory, MarketEvent
 
@@ -127,6 +129,9 @@ def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
     evt_label = f"{search_ticker} {event_type.upper()}" if event_ticker else event_type.upper()
     console.print(f"\n[bold cyan]⚡ Analyzing {ticker} around {evt_label} events[/bold cyan]")
     console.print(f"   Provider: {dp.name()} | Window: -{days_before}/+{days_after} days\n")
+
+    display_ticker_info(fetch_ticker_info(ticker))
+    console.print()
 
     # Get relevant events
     events = catalog.search(category=category, ticker=search_ticker)
@@ -259,6 +264,9 @@ def compare(ticker, current_start, current_end, hist_start, hist_end, provider, 
     console.print(f"  Current: {cs} → {ce}")
     console.print(f"  Historical: {hs} → {he}\n")
 
+    display_ticker_info(fetch_ticker_info(ticker))
+    console.print()
+
     with Progress(SpinnerColumn(), TextColumn("[bold blue]Fetching data...")) as progress:
         task = progress.add_task("fetch", total=None)
         try:
@@ -312,6 +320,9 @@ def sr(ticker, lookback, levels, window, provider, verbose):
 
     console.print(f"\n[bold cyan]S/R Analysis: {ticker}[/bold cyan]")
     console.print(f"  Period: {start} → {end} ({lookback} days)\n")
+
+    display_ticker_info(fetch_ticker_info(ticker))
+    console.print()
 
     with Progress(SpinnerColumn(), TextColumn("[bold blue]Fetching data...")) as progress:
         task = progress.add_task("fetch", total=None)
@@ -370,6 +381,9 @@ def scan(ticker, days, lookback, step, top_n, export_json, provider, verbose):
     console.print(f"\n[bold cyan]⚡ Scanning {ticker} for similar price patterns[/bold cyan]")
     console.print(f"   Window: {days} trading days | Lookback: {lookback} calendar days | Step: {step}")
     console.print(f"   Provider: {dp.name()}\n")
+
+    display_ticker_info(fetch_ticker_info(ticker))
+    console.print()
 
     with Progress(SpinnerColumn(), TextColumn("[bold blue]Fetching historical data...")) as progress:
         task = progress.add_task("fetch", total=None)
@@ -594,6 +608,9 @@ def export(ticker, event_type, output, days_before, days_after, event_ticker, pr
         return
 
     console.print(f"[bold cyan]Exporting {ticker} × {event_type} analysis...[/bold cyan]\n")
+
+    display_ticker_info(fetch_ticker_info(ticker))
+    console.print()
 
     t_date = date.today()
     target_window = fetch_event_window(dp, ticker, t_date, days_before, days_after)

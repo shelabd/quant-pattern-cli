@@ -25,6 +25,58 @@ from .events import MarketEvent, EventCategory, EVENT_CATEGORY_LABELS
 console = Console()
 
 
+# ── Ticker Info ──────────────────────────────────────────────────────────────────
+
+def display_ticker_info(info: dict):
+    """Display ticker metadata as a compact panel."""
+    name = info.get("name") or "Unknown"
+    quote_type = info.get("quote_type") or ""
+    sector = info.get("sector")
+    industry = info.get("industry")
+    exchange = info.get("exchange")
+    market_cap = info.get("market_cap")
+    currency = info.get("currency") or "USD"
+    description = info.get("description")
+
+    # Type badge
+    type_map = {"ETF": "ETF", "EQUITY": "Stock", "CRYPTOCURRENCY": "Crypto",
+                "MUTUALFUND": "Fund", "INDEX": "Index", "FUTURE": "Futures"}
+    type_label = type_map.get(quote_type, quote_type or "")
+
+    # Format market cap
+    cap_str = None
+    if market_cap:
+        if market_cap >= 1_000_000_000_000:
+            cap_str = f"${market_cap / 1_000_000_000_000:.2f}T"
+        elif market_cap >= 1_000_000_000:
+            cap_str = f"${market_cap / 1_000_000_000:.2f}B"
+        elif market_cap >= 1_000_000:
+            cap_str = f"${market_cap / 1_000_000:.1f}M"
+        else:
+            cap_str = f"${market_cap:,.0f}"
+
+    # Build detail line
+    details = []
+    if type_label:
+        details.append(f"[yellow]{type_label}[/yellow]")
+    if sector and industry:
+        details.append(f"{sector} · {industry}")
+    elif sector:
+        details.append(sector)
+    if exchange:
+        details.append(exchange)
+    if cap_str:
+        details.append(f"Mkt Cap: {cap_str} {currency}")
+
+    lines = f"[bold bright_white]{name}[/bold bright_white]"
+    if details:
+        lines += f"\n{'  ·  '.join(details)}"
+    if description:
+        lines += f"\n[dim]{description[:200]}[/dim]"
+
+    console.print(Panel(lines, border_style="cyan", padding=(0, 1)))
+
+
 # ── Utilities ───────────────────────────────────────────────────────────────────
 
 def _sparkline(values: list[float], width: int = 30) -> str:

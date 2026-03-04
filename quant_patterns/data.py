@@ -129,6 +129,39 @@ class IBKRProvider(DataProvider):
             ib.disconnect()
 
 
+def fetch_ticker_info(ticker: str) -> dict:
+    """
+    Fetch ticker metadata (name, description, type, sector, etc.) via yfinance.
+    Returns a dict with keys: name, description, quote_type, sector, industry,
+    exchange, market_cap, currency. Missing fields are None.
+    """
+    try:
+        tk = yf.Ticker(ticker)
+        info = tk.info or {}
+    except Exception as e:
+        logger.warning(f"Could not fetch info for {ticker}: {e}")
+        return {"name": ticker, "description": None, "quote_type": None,
+                "sector": None, "industry": None, "exchange": None,
+                "market_cap": None, "currency": None}
+
+    # Build a short description: first two sentences of the summary
+    summary = info.get("longBusinessSummary") or ""
+    short_desc = ". ".join(summary.split(". ")[:2]).strip()
+    if short_desc and not short_desc.endswith("."):
+        short_desc += "."
+
+    return {
+        "name": info.get("longName") or info.get("shortName") or ticker,
+        "description": short_desc or None,
+        "quote_type": info.get("quoteType"),
+        "sector": info.get("sector"),
+        "industry": info.get("industry"),
+        "exchange": info.get("exchange"),
+        "market_cap": info.get("marketCap"),
+        "currency": info.get("currency"),
+    }
+
+
 def get_provider(name: str = "yfinance", **kwargs) -> DataProvider:
     """Factory for data providers."""
     providers = {
