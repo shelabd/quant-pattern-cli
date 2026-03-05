@@ -118,6 +118,7 @@ BUILTIN_EVENTS: list[MarketEvent] = [
     MarketEvent("Hamas Attack on Israel", "2023-10-07", EventCategory.GEOPOLITICAL, "Oct 7 attack"),
     MarketEvent("Iran-Israel Escalation", "2024-04-13", EventCategory.GEOPOLITICAL, "Iran drone/missile attack on Israel"),
     MarketEvent("Trump Tariffs Escalation", "2025-02-01", EventCategory.GEOPOLITICAL, "New tariff announcements"),
+    MarketEvent("US-Israel Strike Iran", "2026-02-28", EventCategory.GEOPOLITICAL, "Operation Roaring Lion/Epic Fury, joint strikes on Iran"),
 
     # ── US Wars & Military Operations ──────────────────────────────────────
     MarketEvent("Gulf War Begins", "1991-01-17", EventCategory.GEOPOLITICAL, "Operation Desert Storm air campaign starts"),
