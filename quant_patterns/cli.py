@@ -235,8 +235,12 @@ def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
     # Day-by-day forecast
     console.print()
     current_price = float(target_window["Close"].iloc[-1])
+    # Use most recent event date for anchoring when available
+    recent_event = max(events, key=lambda e: e.date) if events else None
+    ev_date = recent_event.date if recent_event and recent_event.date < date.today() else None
     _build_event_forecast(similarity_results, current_price, ticker,
-                          start_date=target_window.index[-1].date())
+                          start_date=target_window.index[-1].date(),
+                          event_date=ev_date, dp=dp)
 
     # Export
     if export_json:
@@ -568,8 +572,15 @@ def _display_scan_forward_returns(df, results, window_size: int):
     console.print(table)
 
 
-def _build_event_forecast(similarity_results, current_price, ticker, start_date=None):
-    """Build a day-by-day forecast from event-based matches' post-event returns."""
+def _build_event_forecast(similarity_results, current_price, ticker, start_date=None,
+                          event_date=None, dp=None):
+    """Build a day-by-day forecast from event-based matches' post-event returns.
+
+    When event_date and dp are provided, anchors forecast to event-day close
+    and includes actual prices for days that have already passed.
+    """
+    import pandas as pd
+
     top = sorted(similarity_results, key=lambda s: s.composite_score, reverse=True)[:5]
 
     forward_returns_by_day: dict[int, list[tuple[float, float]]] = {}
@@ -593,8 +604,32 @@ def _build_event_forecast(similarity_results, current_price, ticker, start_date=
     if not forward_returns_by_day:
         return
 
+    # When event_date provided, anchor forecast to event-day close and get actuals
+    forecast_price = current_price
+    forecast_start = start_date
+    actuals = None
+
+    if event_date and dp:
+        try:
+            actual_df = dp.get_daily_ohlcv(ticker, event_date - timedelta(days=5), date.today())
+            if not actual_df.empty:
+                # Find the event day (or nearest trading day at/after event_date)
+                event_ts = pd.Timestamp(event_date)
+                idx = actual_df.index.searchsorted(event_ts)
+                if idx < len(actual_df):
+                    forecast_price = float(actual_df["Close"].iloc[idx])
+                    forecast_start = actual_df.index[idx].date()
+
+                    # Build actuals dict for days after event
+                    actuals = {}
+                    for j in range(idx + 1, len(actual_df)):
+                        d = actual_df.index[j].date()
+                        actuals[d] = float(actual_df["Close"].iloc[j])
+        except Exception as e:
+            logger.warning(f"Could not fetch actuals for backtest: {e}")
+
     forecast = []
-    projected = current_price
+    projected = forecast_price
     for day in sorted(forward_returns_by_day.keys()):
         entries = forward_returns_by_day[day]
         total_weight = sum(w for _, w in entries)
@@ -610,7 +645,8 @@ def _build_event_forecast(similarity_results, current_price, ticker, start_date=
         })
 
     if forecast:
-        display_scan_forecast(forecast, ticker, current_price, start_date=start_date)
+        display_scan_forecast(forecast, ticker, forecast_price,
+                              start_date=forecast_start, actuals=actuals)
 
 
 def _display_forecast(df, results, window_size: int, ticker: str):
@@ -798,8 +834,11 @@ def export(ticker, event_type, output, days_before, days_after, event_ticker, pr
     if similarity_results:
         console.print()
         current_price = float(target_window["Close"].iloc[-1])
+        recent_event = max(events_list, key=lambda e: e.date) if events_list else None
+        ev_date = recent_event.date if recent_event and recent_event.date < date.today() else None
         _build_event_forecast(similarity_results, current_price, ticker,
-                          start_date=target_window.index[-1].date())
+                          start_date=target_window.index[-1].date(),
+                          event_date=ev_date, dp=dp)
 
     export_data = export_for_agent(profile, sr_levels, target_window, volume_price=vp_profile)
 
@@ -931,8 +970,11 @@ def interactive(provider, verbose):
         # Day-by-day forecast
         console.print()
         current_price = float(target_window["Close"].iloc[-1])
+        recent_event = max(events_list, key=lambda e: e.date) if events_list else None
+        ev_date = recent_event.date if recent_event and recent_event.date < date.today() else None
         _build_event_forecast(similarity_results, current_price, ticker,
-                          start_date=target_window.index[-1].date())
+                          start_date=target_window.index[-1].date(),
+                          event_date=ev_date, dp=dp)
 
     # Export option
     if Prompt.ask("\n[bold]Export to JSON?", choices=["y", "n"], default="n") == "y":

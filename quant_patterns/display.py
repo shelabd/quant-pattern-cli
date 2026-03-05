@@ -446,14 +446,19 @@ def _next_trading_day(d: date, n: int) -> date:
 
 
 def display_scan_forecast(forecast: list[dict], ticker: str, current_price: float,
-                          start_date: Optional[date] = None):
+                          start_date: Optional[date] = None,
+                          actuals: Optional[dict] = None):
     """
     Display a day-by-day price forecast table.
 
     Each entry in forecast: {day, price, change_pct, contributors}
+    actuals: optional dict mapping date -> actual close price for backtesting
     """
     if start_date is None:
         start_date = date.today()
+
+    has_actuals = actuals is not None and len(actuals) > 0
+    today = date.today()
 
     table = Table(
         title=f"Price Forecast — {ticker} (based on top historical matches)",
@@ -462,10 +467,13 @@ def display_scan_forecast(forecast: list[dict], ticker: str, current_price: floa
     )
     table.add_column("Day", justify="center", width=5)
     table.add_column("Date", width=12)
-    table.add_column("Projected Price", justify="right", width=16)
+    table.add_column("Predicted", justify="right", width=14)
+    if has_actuals:
+        table.add_column("Actual", justify="right", width=14)
+        table.add_column("Miss", justify="right", width=9)
     table.add_column("Change", justify="right", width=10)
     table.add_column("Cumulative", justify="right", width=10)
-    table.add_column("Trend", width=30)
+    table.add_column("Trend", width=24)
 
     cum_pct = 0.0
     prices = []
@@ -487,14 +495,37 @@ def display_scan_forecast(forecast: list[dict], ticker: str, current_price: floa
         else:
             trend = f"[red]{'▓' * bar_len}{'░' * (20 - bar_len)}[/red]"
 
-        table.add_row(
-            f"+{day}",
-            forecast_date.strftime("%Y-%m-%d"),
-            f"${price:.2f}",
+        is_past = forecast_date <= today
+
+        # Build row
+        row = [f"+{day}"]
+
+        if is_past and has_actuals:
+            row.append(Text(forecast_date.strftime("%Y-%m-%d"), style="bold"))
+        else:
+            row.append(forecast_date.strftime("%Y-%m-%d"))
+
+        row.append(f"${price:.2f}")
+
+        if has_actuals:
+            actual = actuals.get(forecast_date)
+            if actual is not None:
+                miss_pct = ((price - actual) / actual) * 100
+                miss_color = "green" if abs(miss_pct) < 0.5 else "yellow" if abs(miss_pct) < 1.5 else "red"
+                row.append(Text(f"${actual:.2f}", style="bold"))
+                row.append(Text(f"{miss_pct:+.1f}%", style=miss_color))
+            else:
+                row.append(Text("—", style="dim"))
+                row.append(Text("—", style="dim"))
+
+        row.extend([
             Text(f"{change_pct:+.2f}%", style=color),
             Text(f"{cum_pct:+.2f}%", style=cum_color),
             trend,
-        )
+        ])
+
+        table.add_row(*row, end_section=(is_past and has_actuals and
+            _next_trading_day(start_date, day + 1) > today))
 
     console.print(table)
 
