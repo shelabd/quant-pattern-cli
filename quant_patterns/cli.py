@@ -80,6 +80,18 @@ def get_data_provider(provider_name: str) -> DataProvider:
         sys.exit(1)
 
 
+def _find_backtest_anchor(catalog: EventCatalog, category: EventCategory,
+                          max_age_days: int = 60) -> Optional[date]:
+    """Find the most recent past event in the category for forecast backtesting."""
+    all_events = catalog.search(category=category)
+    today = date.today()
+    past_recent = [e for e in all_events
+                   if e.date < today and (today - e.date).days <= max_age_days]
+    if past_recent:
+        return max(past_recent, key=lambda e: e.date).date
+    return None
+
+
 # ── CLI Group ───────────────────────────────────────────────────────────────────
 
 @click.group()
@@ -235,12 +247,10 @@ def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
     # Day-by-day forecast
     console.print()
     current_price = float(target_window["Close"].iloc[-1])
-    # Use most recent event date for anchoring when available
-    recent_event = max(events, key=lambda e: e.date) if events else None
-    ev_date = recent_event.date if recent_event and recent_event.date < date.today() else None
+    anchor_date = _find_backtest_anchor(catalog, category)
     _build_event_forecast(similarity_results, current_price, ticker,
                           start_date=target_window.index[-1].date(),
-                          event_date=ev_date, dp=dp)
+                          event_date=anchor_date, dp=dp)
 
     # Export
     if export_json:
@@ -834,11 +844,10 @@ def export(ticker, event_type, output, days_before, days_after, event_ticker, pr
     if similarity_results:
         console.print()
         current_price = float(target_window["Close"].iloc[-1])
-        recent_event = max(events_list, key=lambda e: e.date) if events_list else None
-        ev_date = recent_event.date if recent_event and recent_event.date < date.today() else None
+        anchor_date = _find_backtest_anchor(catalog, category)
         _build_event_forecast(similarity_results, current_price, ticker,
                           start_date=target_window.index[-1].date(),
-                          event_date=ev_date, dp=dp)
+                          event_date=anchor_date, dp=dp)
 
     export_data = export_for_agent(profile, sr_levels, target_window, volume_price=vp_profile)
 
@@ -970,11 +979,10 @@ def interactive(provider, verbose):
         # Day-by-day forecast
         console.print()
         current_price = float(target_window["Close"].iloc[-1])
-        recent_event = max(events_list, key=lambda e: e.date) if events_list else None
-        ev_date = recent_event.date if recent_event and recent_event.date < date.today() else None
+        anchor_date = _find_backtest_anchor(catalog, category)
         _build_event_forecast(similarity_results, current_price, ticker,
                           start_date=target_window.index[-1].date(),
-                          event_date=ev_date, dp=dp)
+                          event_date=anchor_date, dp=dp)
 
     # Export option
     if Prompt.ask("\n[bold]Export to JSON?", choices=["y", "n"], default="n") == "y":
