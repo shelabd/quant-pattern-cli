@@ -21,6 +21,7 @@ from rich import box
 
 from .analysis import Level, SimilarityResult, PatternProfile, VolumePriceProfile
 from .events import MarketEvent, EventCategory, EVENT_CATEGORY_LABELS
+from .regime import RegimeResult
 
 console = Console()
 
@@ -683,6 +684,31 @@ def display_volume_price_profile(profile: VolumePriceProfile, show_daily: bool =
         console.print(table)
 
 
+def display_potus_schedule(items: list[dict]):
+    """Display RSS feed items from White House feeds."""
+    table = Table(
+        title="White House — Presidential Actions",
+        box=box.ROUNDED,
+        show_lines=False,
+        header_style="bold cyan",
+    )
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Date", style="white", width=12)
+    table.add_column("Type", style="yellow", width=18)
+    table.add_column("Title", style="bright_white", width=50)
+    table.add_column("Source", style="dim", width=10)
+
+    for i, item in enumerate(items, 1):
+        d = item.get("date")
+        date_str = d.isoformat() if d else "—"
+        category = item.get("category", "")[:18]
+        title = item.get("title", "")[:50]
+        source = "WH.gov"
+        table.add_row(str(i), date_str, category, title, source)
+
+    console.print(table)
+
+
 def display_categories():
     """Display available event categories."""
     table = Table(title="Event Categories", box=box.ROUNDED, header_style="bold cyan")
@@ -691,5 +717,195 @@ def display_categories():
 
     for cat in EventCategory:
         table.add_row(cat.value, EVENT_CATEGORY_LABELS.get(cat, ""))
+
+    console.print(table)
+
+
+# ── Regime Display ──────────────────────────────────────────────────────────
+
+def _regime_color(label: str) -> str:
+    """Return Rich color for regime label."""
+    colors = {
+        "Bull-Trend": "bright_green",
+        "Bear-Trend": "red",
+        "Low-Vol-Range": "yellow",
+        "High-Vol-Stress": "bright_red",
+    }
+    return colors.get(label, "white")
+
+
+def display_regime_summary(result: RegimeResult):
+    """Panel with current regime label + confidence, probability bar chart."""
+    color = _regime_color(result.current_regime)
+    conf = result.probabilities.get(result.current_regime, 0)
+
+    summary = Text()
+    summary.append("  Current Regime: ", style="bold white")
+    summary.append(result.current_regime, style=f"bold {color}")
+    summary.append(f"  ({conf:.1%} confidence)", style="dim")
+    summary.append("\n  Observations: ", style="bold white")
+    summary.append(f"{result.n_observations}", style="white")
+    summary.append("  |  ", style="dim")
+    summary.append("Converged: ", style="bold white")
+    conv_color = "green" if result.converged else "yellow"
+    summary.append(f"{'Yes' if result.converged else 'No'}", style=conv_color)
+
+    # Probability distribution as bar chart
+    summary.append("\n\n  Regime Probabilities:\n", style="bold white")
+    for label in ["Bull-Trend", "Low-Vol-Range", "Bear-Trend", "High-Vol-Stress"]:
+        prob = result.probabilities.get(label, 0)
+        bar_len = int(prob * 30)
+        bar = "█" * bar_len + "░" * (30 - bar_len)
+        lc = _regime_color(label)
+        summary.append(f"    {label:<18}", style=lc)
+        summary.append(f" {bar} ", style=lc)
+        summary.append(f"{prob:.1%}\n", style="white")
+
+    console.print(Panel(
+        summary,
+        title=f"[bold]Market Regime — {result.ticker}[/bold]",
+        border_style="cyan",
+        padding=(0, 1),
+    ))
+
+
+def display_regime_states(result: RegimeResult):
+    """Table of state characteristics."""
+    table = Table(
+        title="Regime State Characteristics",
+        box=box.ROUNDED,
+        header_style="bold cyan",
+    )
+    table.add_column("Regime", width=18)
+    table.add_column("Mean Return", justify="right", width=14)
+    table.add_column("Mean Volatility", justify="right", width=14)
+    table.add_column("VIX Ratio", justify="right", width=10)
+    table.add_column("Frequency", justify="right", width=10)
+    table.add_column("", width=22)
+
+    for s in sorted(result.states, key=lambda x: x.mean_return, reverse=True):
+        color = _regime_color(s.label)
+        # Annualize: mean daily log return * 252
+        ann_ret = s.mean_return * 252 * 100
+        ann_vol = s.mean_volatility * np.sqrt(252) * 100 if s.mean_volatility > 0 else 0
+
+        freq_bar = "█" * int(s.frequency_pct / 5) + "░" * (20 - int(s.frequency_pct / 5))
+
+        ret_color = "green" if ann_ret > 0 else "red"
+        table.add_row(
+            Text(s.label, style=f"bold {color}"),
+            Text(f"{ann_ret:+.1f}%/yr", style=ret_color),
+            Text(f"{ann_vol:.1f}%/yr", style="white"),
+            f"{s.mean_vix_ratio:.2f}",
+            f"{s.frequency_pct:.1f}%",
+            Text(freq_bar, style=color),
+        )
+
+    console.print(table)
+
+
+def display_regime_chart(result: RegimeResult):
+    """ASCII price chart with regime-letter timeline strip below."""
+    history = result.regime_history
+    if history.empty:
+        return
+
+    close = history["Close"].values
+    labels = history["regime_label"].values
+    dates = history.index
+    n = len(close)
+
+    height = 15
+    width = 70
+
+    mn = float(np.min(close))
+    mx = float(np.max(close))
+    rng = mx - mn if mx != mn else 1
+    price_step = rng / height
+
+    # Build chart grid
+    chart = [[" " for _ in range(width)] for _ in range(height + 1)]
+
+    # Plot price line
+    for i in range(n):
+        x = int(i / max(n - 1, 1) * (width - 1))
+        y = int((close[i] - mn) / rng * height)
+        y = min(height, max(0, y))
+        row = height - y
+        chart[row][x] = "●"
+
+    # Build regime timeline strip
+    label_map = {"Bull-Trend": "B", "Bear-Trend": "D", "Low-Vol-Range": "R", "High-Vol-Stress": "S"}
+    regime_strip = [" "] * width
+    for i in range(n):
+        x = int(i / max(n - 1, 1) * (width - 1))
+        letter = label_map.get(labels[i], "?")
+        regime_strip[x] = letter
+
+    # Render
+    lines = []
+    lines.append(f"  {result.ticker} Price + Regime Timeline")
+    lines.append(f"  {'─' * width}")
+
+    for r in range(height + 1):
+        price_at_row = mx - r * price_step
+        label_str = f"{price_at_row:>8.2f} │"
+        row_str = "".join(chart[r])
+        lines.append(f"{label_str}{row_str}")
+
+    lines.append(f"{'':>9}└{'─' * width}")
+
+    # Regime strip with colors
+    lines.append(f"{'':>9} {''.join(regime_strip)}")
+    lines.append(f"{'':>9} B=Bull  D=Bear  R=Range  S=Stress")
+
+    # Date axis
+    if len(dates) >= 2:
+        start_label = dates[0].strftime("%Y-%m-%d")
+        end_label = dates[-1].strftime("%Y-%m-%d")
+        spacing = width - len(start_label) - len(end_label)
+        lines.append(f"{'':>10}{start_label}{' ' * max(0, spacing)}{end_label}")
+
+    console.print(Panel("\n".join(lines), border_style="blue"))
+
+
+def display_regime_conditional_winrates(ticker: str, category: str, regime_winrates: dict):
+    """Table of win rate / avg return / sample size per regime.
+
+    regime_winrates: {label: {"win_rate": float, "avg_return": float, "count": int}}
+    """
+    table = Table(
+        title=f"Regime-Conditional Win Rates — {ticker} × {category.upper()}",
+        box=box.ROUNDED,
+        header_style="bold cyan",
+    )
+    table.add_column("Regime", width=18)
+    table.add_column("Win Rate", justify="right", width=10)
+    table.add_column("Avg Return", justify="right", width=12)
+    table.add_column("Sample", justify="center", width=8)
+    table.add_column("", width=22)
+
+    for label in ["Bull-Trend", "Low-Vol-Range", "Bear-Trend", "High-Vol-Stress"]:
+        data = regime_winrates.get(label)
+        if data is None:
+            continue
+        color = _regime_color(label)
+        wr = data["win_rate"]
+        avg_ret = data["avg_return"]
+        count = data["count"]
+
+        wr_color = "green" if wr > 50 else "yellow" if wr > 40 else "red"
+        ret_color = "green" if avg_ret > 0 else "red"
+
+        bar_len = int(wr / 5)
+        bar = "█" * bar_len + "░" * (20 - bar_len)
+
+        table.add_row(
+            Text(label, style=f"bold {color}"),
+            Text(f"{wr:.1f}%", style=wr_color),
+            Text(f"{avg_ret:+.3f}%", style=ret_color),
+            str(count),
+            Text(bar, style=wr_color),
+        )
 
     console.print(table)

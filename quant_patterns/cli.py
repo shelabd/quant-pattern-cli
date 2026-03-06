@@ -47,6 +47,11 @@ from .display import (
     display_comparison_chart,
     display_event_list,
     display_pattern_profile,
+    display_potus_schedule,
+    display_regime_chart,
+    display_regime_conditional_winrates,
+    display_regime_states,
+    display_regime_summary,
     display_scan_forecast,
     display_similarity_results,
     display_support_resistance,
@@ -127,9 +132,11 @@ def cli():
 @click.option("--top-n", "-n", default=5, help="Number of top matches to show")
 @click.option("--export-json", "-o", default=None, help="Export results to JSON file")
 @click.option("--event-ticker", "-et", default=None, help="Use events for this ticker (e.g. analyze SPY around NVDA earnings)")
+@click.option("--regime-filter", "-rf", is_flag=True, default=False, help="Filter events by current market regime")
+@click.option("--regime-lookback", default=750, help="Lookback days for regime detection")
 @common_options
 def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
-            export_json, event_ticker, provider, verbose):
+            export_json, event_ticker, provider, verbose, regime_filter, regime_lookback):
     """
     Run full pattern analysis for TICKER around events of a given type.
 
@@ -162,6 +169,26 @@ def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
     if not events:
         console.print(f"[red]No {event_type} events found for {ticker}[/red]")
         return
+
+    # Regime filtering
+    regime_result = None
+    if regime_filter:
+        from .regime import run_regime_detection, filter_events_by_regime
+
+        console.print("  [bold]Detecting market regime...[/bold]")
+        try:
+            regime_result = run_regime_detection(dp, ticker, lookback_days=regime_lookback)
+            current_regime = regime_result.current_regime
+            console.print(f"  Current regime: [bold]{current_regime}[/bold]")
+
+            filtered = filter_events_by_regime(events, regime_result, current_regime)
+            if filtered:
+                console.print(f"  Filtered {len(events)} → {len(filtered)} events matching {current_regime}\n")
+                events = filtered
+            else:
+                console.print(f"  [yellow]No events in {current_regime} regime — using all events[/yellow]\n")
+        except Exception as e:
+            console.print(f"  [yellow]Regime detection failed ({e}), proceeding without filter[/yellow]\n")
 
     console.print(f"  Found {len(events)} relevant events\n")
     display_event_list(events)
@@ -253,6 +280,42 @@ def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
     profile = build_pattern_profile(ticker, event_type, windows, similarity_results)
     display_pattern_profile(profile)
 
+    # Regime-conditional win rates
+    if regime_filter and regime_result is not None:
+        from .regime import get_regime_at_date
+
+        console.print()
+        all_category_events = catalog.search(category=category, ticker=search_ticker)
+        regime_winrates: dict[str, dict] = {}
+        for state in regime_result.states:
+            label = state.label
+            returns_in_regime = []
+            for event in all_category_events:
+                r_label = get_regime_at_date(regime_result, event.date)
+                if r_label != label:
+                    continue
+                # Look up return from already-computed similarity results or windows
+                for sr in similarity_results:
+                    if sr.event_date == event.date and sr.window_data is not None:
+                        wd = sr.window_data
+                        if "rel_day" in wd.columns:
+                            post = wd[wd["rel_day"] > 0]["Close"]
+                            ev = wd[wd["rel_day"] == 0]["Close"]
+                            if not ev.empty and len(post) >= 1:
+                                ret = (post.iloc[-1] / ev.values[0] - 1) * 100
+                                returns_in_regime.append(ret)
+                        break
+
+            if returns_in_regime:
+                win_count = sum(1 for r in returns_in_regime if r > 0)
+                regime_winrates[label] = {
+                    "win_rate": win_count / len(returns_in_regime) * 100,
+                    "avg_return": float(np.mean(returns_in_regime)),
+                    "count": len(returns_in_regime),
+                }
+        if regime_winrates:
+            display_regime_conditional_winrates(ticker, event_type, regime_winrates)
+
     # Day-by-day forecast
     console.print()
     current_price = float(target_window["Close"].iloc[-1])
@@ -265,7 +328,9 @@ def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
 
     # Export
     if export_json:
-        export_data = export_for_agent(profile, sr_levels, target_window, volume_price=vp_profile)
+        regime_data = regime_result.to_dict() if regime_result else None
+        export_data = export_for_agent(profile, sr_levels, target_window,
+                                       volume_price=vp_profile, regime=regime_data)
         path = Path(export_json)
         path.write_text(json.dumps(export_data, indent=2, default=str))
         console.print(f"\n[green]✓ Exported to {path}[/green]")
@@ -1136,6 +1201,136 @@ def interactive(provider, verbose):
             export_data = export_for_agent(profile, sr_levels, target_window, volume_price=vp_profile)
             Path(out).write_text(json.dumps(export_data, indent=2, default=str))
             console.print(f"[green]✓ Exported to {out}[/green]")
+
+
+# ── REGIME command ─────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("ticker")
+@click.option("--lookback", "-l", default=750, help="Lookback period in calendar days")
+@click.option("--states", "-s", default=4, help="Number of HMM states (2-6)")
+@click.option("--export-json", "-o", default=None, help="Export regime result to JSON file")
+@common_options
+def regime(ticker, lookback, states, export_json, provider, verbose):
+    """
+    Detect the current market regime for TICKER using HMM.
+
+    Identifies Bull-Trend, Bear-Trend, Low-Vol-Range, and High-Vol-Stress
+    regimes from price, volatility, and macro features.
+
+    Examples:
+
+      qpat regime SPY
+
+      qpat regime QQQ --lookback 1500
+
+      qpat regime NVDA -o regime.json
+    """
+    setup_logging(verbose)
+    ticker = ticker.upper()
+    dp = get_data_provider(provider)
+
+    console.print(f"\n[bold cyan]⚡ Regime Detection: {ticker}[/bold cyan]")
+    console.print(f"   Lookback: {lookback} days | States: {states} | Provider: {dp.name()}\n")
+
+    display_ticker_info(fetch_ticker_info(ticker))
+    console.print()
+
+    # Lazy import to avoid loading hmmlearn at startup
+    from .regime import run_regime_detection
+
+    with Progress(SpinnerColumn(), TextColumn("[bold blue]Detecting regimes...")) as progress:
+        task = progress.add_task("detect", total=None)
+        try:
+            result = run_regime_detection(dp, ticker, lookback_days=lookback, n_states=states)
+        except Exception as e:
+            console.print(f"[red]Error: {e}[/red]")
+            return
+
+    console.print()
+    display_regime_summary(result)
+    console.print()
+    display_regime_states(result)
+    console.print()
+    display_regime_chart(result)
+
+    if export_json:
+        path = Path(export_json)
+        path.write_text(json.dumps(result.to_dict(), indent=2, default=str))
+        console.print(f"\n[green]✓ Exported regime data to {path}[/green]")
+
+
+# ── POTUS command ──────────────────────────────────────────────────────────────
+
+@cli.group()
+def potus():
+    """View and sync presidential actions from White House RSS feeds."""
+    pass
+
+
+@potus.command("schedule")
+@click.option("--feed", "-f", type=click.Choice(["actions", "briefings", "all"]),
+              default="actions", help="Which WH feed to pull")
+@click.option("--limit", "-n", default=20, help="Number of items to show")
+def potus_schedule(feed, limit):
+    """View latest presidential actions from the White House RSS feed."""
+    from .potus import fetch_potus_feed, FEED_URLS
+
+    feeds = list(FEED_URLS) if feed == "all" else [feed]
+    all_items = []
+    for f in feeds:
+        try:
+            items = fetch_potus_feed(f)
+            all_items.extend(items)
+        except Exception as e:
+            console.print(f"[red]Error fetching {f} feed: {e}[/red]")
+
+    if not all_items:
+        console.print("[yellow]No items retrieved from RSS feed[/yellow]")
+        return
+
+    # Sort by date descending
+    all_items.sort(key=lambda x: x.get("date") or date.min, reverse=True)
+    display_potus_schedule(all_items[:limit])
+    console.print(f"\n  Showing {min(limit, len(all_items))} of {len(all_items)} items")
+
+
+@potus.command("sync")
+@click.option("--feed", "-f", type=click.Choice(["actions", "briefings", "all"]),
+              default="actions", help="Which WH feed to sync")
+@click.option("--market-only", "-m", is_flag=True, help="Only sync market-relevant actions")
+def potus_sync(feed, market_only):
+    """Sync presidential actions from RSS to local cache."""
+    from .potus import sync_potus_events
+
+    console.print(f"[bold cyan]Syncing POTUS events from {feed} feed...[/bold cyan]")
+    if market_only:
+        console.print("  Filtering for market-relevant actions only")
+
+    try:
+        added = sync_potus_events(feed=feed, market_only=market_only)
+        if added:
+            console.print(f"[green]  Added {len(added)} new events to cache[/green]")
+            for evt in added[:10]:
+                console.print(f"    + {evt.date} — {evt.name}")
+            if len(added) > 10:
+                console.print(f"    ... and {len(added) - 10} more")
+        else:
+            console.print("[dim]  No new events to add (cache is up to date)[/dim]")
+    except Exception as e:
+        console.print(f"[red]Error syncing: {e}[/red]")
+
+
+@potus.command("list")
+def potus_list():
+    """Show all POTUS events (built-in + cached)."""
+    catalog = EventCatalog()
+    events = catalog.filter_by_category(EventCategory.POTUS)
+    if not events:
+        console.print("[yellow]No POTUS events found[/yellow]")
+        return
+    display_event_list(events)
+    console.print(f"\n  Total: {len(events)} POTUS events")
 
 
 if __name__ == "__main__":

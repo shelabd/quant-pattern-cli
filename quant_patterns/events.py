@@ -27,6 +27,7 @@ class EventCategory(str, Enum):
     RETAIL_SALES = "retail_sales"
     OPEC = "opec"
     CRYPTO = "crypto"
+    POTUS = "potus"
     CUSTOM = "custom"
 
     def __str__(self) -> str:
@@ -45,6 +46,7 @@ EVENT_CATEGORY_LABELS = {
     EventCategory.RETAIL_SALES: "Retail Sales Data",
     EventCategory.OPEC: "OPEC Decision",
     EventCategory.CRYPTO: "Crypto Event (Hacks, Collapses, Regulation, etc.)",
+    EventCategory.POTUS: "Presidential Actions (Executive Orders, Tariffs, etc.)",
     EventCategory.CUSTOM: "Custom Event",
 }
 
@@ -183,16 +185,44 @@ BUILTIN_EVENTS: list[MarketEvent] = [
     MarketEvent("Bitcoin Halving 2024", "2024-04-20", EventCategory.CRYPTO, "4th halving: block reward drops to 3.125 BTC"),
     MarketEvent("Spot ETH ETF Approved", "2024-05-23", EventCategory.CRYPTO, "SEC approves spot Ethereum ETFs"),
     MarketEvent("BTC New ATH $100K", "2024-12-05", EventCategory.CRYPTO, "Bitcoin crosses $100K for the first time"),
+
+    # ── Presidential Actions (POTUS) ─────────────────────────────────────
+    # Biden Administration
+    MarketEvent("Biden Crypto Executive Order", "2022-03-09", EventCategory.POTUS, "EO on responsible development of digital assets"),
+    MarketEvent("CHIPS and Science Act Signed", "2022-08-09", EventCategory.POTUS, "Biden signs $280B CHIPS Act into law"),
+    MarketEvent("Inflation Reduction Act Signed", "2022-08-16", EventCategory.POTUS, "Biden signs $740B IRA: climate, health, taxes"),
+    MarketEvent("Biden SOTU 2023", "2023-02-07", EventCategory.POTUS, "State of the Union address"),
+    MarketEvent("AI Safety Executive Order", "2023-10-30", EventCategory.POTUS, "EO on safe, secure, and trustworthy AI"),
+    MarketEvent("Biden SOTU 2024", "2024-03-07", EventCategory.POTUS, "State of the Union address"),
+
+    # Trump 2nd Term
+    MarketEvent("Trump Inauguration 2025", "2025-01-20", EventCategory.POTUS, "47th President inaugurated"),
+    MarketEvent("Trump Day-One EO Blitz", "2025-01-20", EventCategory.POTUS, "Dozens of executive orders signed on day one"),
+    MarketEvent("DOGE Executive Order", "2025-01-20", EventCategory.POTUS, "EO establishing Department of Government Efficiency"),
+    MarketEvent("Canada/Mexico 25% Tariffs", "2025-02-01", EventCategory.POTUS, "25% tariffs on Canada/Mexico imports announced"),
+    MarketEvent("Canada/Mexico Tariff Pause", "2025-02-03", EventCategory.POTUS, "30-day pause on Canada/Mexico tariffs"),
+    MarketEvent("Steel & Aluminum 25% Tariffs", "2025-02-10", EventCategory.POTUS, "25% tariffs on all steel/aluminum imports"),
+    MarketEvent("Reciprocal Tariffs Announced", "2025-02-13", EventCategory.POTUS, "Reciprocal tariff framework announced"),
+    MarketEvent("Crypto Strategic Reserve EO", "2025-03-06", EventCategory.POTUS, "EO to establish US strategic crypto reserve"),
+    MarketEvent("China Tariffs to 20%", "2025-03-04", EventCategory.POTUS, "China tariffs increased to 20%"),
+    MarketEvent("Trump Address to Congress 2025", "2025-03-04", EventCategory.POTUS, "First address to joint session of Congress"),
+    MarketEvent("Liberation Day Tariffs", "2025-04-02", EventCategory.POTUS, "Sweeping reciprocal tariffs on ~185 countries"),
+    MarketEvent("2026 Import Surcharge", "2026-01-15", EventCategory.POTUS, "Broad import surcharge on consumer goods"),
+    MarketEvent("Ratepayer Proclamation", "2026-02-01", EventCategory.POTUS, "Proclamation on energy rate reform"),
+    MarketEvent("Fed Chair Nomination 2026", "2026-02-20", EventCategory.POTUS, "New Federal Reserve Chair nominee announced"),
 ]
 
 
 class EventCatalog:
     """Manages built-in + custom events with filtering and search."""
 
-    def __init__(self, custom_events_path: Optional[Path] = None):
+    def __init__(self, custom_events_path: Optional[Path] = None,
+                 potus_cache_path: Optional[Path] = None):
         self.events: list[MarketEvent] = list(BUILTIN_EVENTS)
         self.custom_path = custom_events_path or Path.home() / ".qpat" / "custom_events.json"
+        self.potus_cache_path = potus_cache_path or Path.home() / ".qpat" / "potus_events.json"
         self._load_custom()
+        self._load_potus_cache()
 
     def _load_custom(self):
         if self.custom_path.exists():
@@ -200,6 +230,19 @@ class EventCatalog:
                 data = json.loads(self.custom_path.read_text())
                 for d in data:
                     self.events.append(MarketEvent.from_dict(d))
+            except Exception:
+                pass
+
+    def _load_potus_cache(self):
+        if self.potus_cache_path.exists():
+            try:
+                data = json.loads(self.potus_cache_path.read_text())
+                existing_keys = {e.key for e in self.events}
+                for d in data:
+                    evt = MarketEvent.from_dict(d)
+                    if evt.key not in existing_keys:
+                        self.events.append(evt)
+                        existing_keys.add(evt.key)
             except Exception:
                 pass
 

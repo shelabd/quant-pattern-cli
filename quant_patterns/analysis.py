@@ -629,6 +629,7 @@ def export_for_agent(
     support_resistance: list[Level],
     target_window: pd.DataFrame,
     volume_price: Optional[VolumePriceProfile] = None,
+    regime: Optional[dict] = None,
 ) -> dict:
     """
     Export analysis results in a structured format for downstream quant agent consumption.
@@ -674,4 +675,5 @@ def export_for_agent(
             "historical_edge_pct": round(profile.avg_return_after, 3),
         },
         "volume_price_authenticity": volume_price.to_dict() if volume_price else None,
+        "regime": regime,
     }
