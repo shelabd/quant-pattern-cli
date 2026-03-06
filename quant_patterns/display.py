@@ -452,12 +452,14 @@ def display_scan_forecast(forecast: list[dict], ticker: str, current_price: floa
     Display a day-by-day price forecast table.
 
     Each entry in forecast: {day, price, change_pct, contributors}
+    Enhanced entries may also contain: {low_25, high_75, low_min, high_max, agree_pct, confidence}
     actuals: optional dict mapping date -> actual close price for backtesting
     """
     if start_date is None:
         start_date = date.today()
 
     has_actuals = actuals is not None and len(actuals) > 0
+    enhanced = len(forecast) > 0 and "low_25" in forecast[0]
     today = date.today()
 
     table = Table(
@@ -473,10 +475,16 @@ def display_scan_forecast(forecast: list[dict], ticker: str, current_price: floa
         table.add_column("Miss", justify="right", width=9)
     table.add_column("Change", justify="right", width=10)
     table.add_column("Cumulative", justify="right", width=10)
+    if enhanced:
+        table.add_column("Range (25-75%)", justify="center", width=16)
+        table.add_column("Agree", justify="center", width=7)
+        table.add_column("Conf", justify="center", width=7)
     table.add_column("Trend", width=24)
 
     cum_pct = 0.0
     prices = []
+    agree_total = 0.0
+    agree_count = 0
     for entry in forecast:
         day = entry["day"]
         price = entry["price"]
@@ -521,8 +529,28 @@ def display_scan_forecast(forecast: list[dict], ticker: str, current_price: floa
         row.extend([
             Text(f"{change_pct:+.2f}%", style=color),
             Text(f"{cum_pct:+.2f}%", style=cum_color),
-            trend,
         ])
+
+        if enhanced:
+            low25 = entry.get("low_25", price)
+            high75 = entry.get("high_75", price)
+            spread = ((high75 - low25) / current_price) * 100
+            spread_color = "green" if spread < 1 else "yellow" if spread < 2.5 else "red"
+            row.append(Text(f"${low25:.0f}-${high75:.0f}", style=spread_color))
+
+            agree = entry.get("agree_pct", 100)
+            agree_color = "green" if agree >= 80 else "yellow" if agree >= 60 else "red"
+            row.append(Text(f"{agree:.0f}%", style=agree_color))
+            agree_total += agree
+            agree_count += 1
+
+            conf = entry.get("confidence", 1.0)
+            filled = int(conf * 5)
+            dots = "●" * filled + "○" * (5 - filled)
+            conf_color = "green" if conf >= 0.7 else "yellow" if conf >= 0.5 else "red"
+            row.append(Text(dots, style=conf_color))
+
+        row.append(trend)
 
         table.add_row(*row, end_section=(is_past and has_actuals and
             _next_trading_day(start_date, day + 1) > today))
@@ -540,6 +568,17 @@ def display_scan_forecast(forecast: list[dict], ticker: str, current_price: floa
             f"[{dir_color}]${final:.2f} ({total_pct:+.2f}% {direction})[/{dir_color}] "
             f"over {len(prices)} trading days"
         )
+
+        if enhanced and agree_count > 0:
+            last_entry = forecast[-1]
+            full_low = last_entry.get("low_min", final)
+            full_high = last_entry.get("high_max", final)
+            avg_agree = agree_total / agree_count
+            console.print(
+                f"  [dim]Full range: ${full_low:.2f} – ${full_high:.2f} | "
+                f"Avg consensus: {avg_agree:.0f}%[/dim]"
+            )
+
         console.print(
             "  [dim]Based on weighted average of top matches' forward returns. "
             "Past patterns do not guarantee future results.[/dim]\n"

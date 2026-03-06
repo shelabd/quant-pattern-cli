@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 import click
+import numpy as np
 from rich.console import Console
 from rich.prompt import Prompt, IntPrompt
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -78,6 +79,14 @@ def get_data_provider(provider_name: str) -> DataProvider:
     except ImportError as e:
         console.print(f"[red]Provider error: {e}[/red]")
         sys.exit(1)
+
+
+# ── Forecast tuning constants ─────────────────────────────────────────────────
+FORECAST_MIN_SCORE = 0.4
+FORECAST_MIN_MATCHES = 2
+FORECAST_FALLBACK_N = 3
+FORECAST_CONF_DECAY = 0.05
+FORECAST_CONF_FLOOR = 0.30
 
 
 def _find_backtest_anchor(catalog: EventCatalog, category: EventCategory,
@@ -247,10 +256,12 @@ def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
     # Day-by-day forecast
     console.print()
     current_price = float(target_window["Close"].iloc[-1])
+    _tw_rets = target_window["Close"].pct_change().dropna().values
+    _current_vol = float(np.std(_tw_rets)) if len(_tw_rets) > 0 else None
     anchor_date = _find_backtest_anchor(catalog, category)
     _build_event_forecast(similarity_results, current_price, ticker,
                           start_date=target_window.index[-1].date(),
-                          event_date=anchor_date, dp=dp)
+                          event_date=anchor_date, dp=dp, current_vol=_current_vol)
 
     # Export
     if export_json:
@@ -583,19 +594,29 @@ def _display_scan_forward_returns(df, results, window_size: int):
 
 
 def _build_event_forecast(similarity_results, current_price, ticker, start_date=None,
-                          event_date=None, dp=None):
+                          event_date=None, dp=None, current_vol=None):
     """Build a day-by-day forecast from event-based matches' post-event returns.
+
+    Uses quality-gated filtering, exponential score weighting, volatility scaling,
+    and per-match tracking for confidence bands.
 
     When event_date and dp are provided, anchors forecast to event-day close
     and includes actual prices for days that have already passed.
     """
     import pandas as pd
 
-    top = sorted(similarity_results, key=lambda s: s.composite_score, reverse=True)[:5]
+    sorted_results = sorted(similarity_results, key=lambda s: s.composite_score, reverse=True)
+
+    # Quality gate: only include matches above score threshold
+    quality = [r for r in sorted_results if r.composite_score >= FORECAST_MIN_SCORE]
+    if len(quality) < FORECAST_MIN_MATCHES:
+        quality = sorted_results[:FORECAST_FALLBACK_N]
+    top = quality
 
     forward_returns_by_day: dict[int, list[tuple[float, float]]] = {}
+    match_daily_returns: dict[int, list[float]] = {}  # match_idx -> [day1_ret, ...]
 
-    for r in top:
+    for mi, r in enumerate(top):
         wd = r.window_data
         if wd is None or "rel_day" not in wd.columns or "Close" not in wd.columns:
             continue
@@ -604,12 +625,29 @@ def _build_event_forecast(similarity_results, current_price, ticker, start_date=
         if len(post) < 2:
             continue
 
-        weight = r.composite_score
-        closes = post["Close"].values
+        weight = r.composite_score ** 2  # Exponential weighting
 
+        # Historical volatility for this match
+        hist_vol = None
+        if len(wd) > 1:
+            closes_all = wd["Close"].values
+            rets = np.diff(closes_all) / closes_all[:-1]
+            if len(rets) > 0:
+                hist_vol = float(np.std(rets))
+
+        vol_ratio = 1.0
+        if current_vol is not None and hist_vol is not None and hist_vol > 0:
+            vol_ratio = max(0.5, min(2.0, current_vol / hist_vol))
+
+        closes = post["Close"].values
+        daily_rets = []
         for i in range(1, len(closes)):
             daily_ret = (closes[i] / closes[i - 1] - 1) * 100
-            forward_returns_by_day.setdefault(i, []).append((daily_ret, weight))
+            scaled_ret = daily_ret * vol_ratio
+            forward_returns_by_day.setdefault(i, []).append((scaled_ret, weight))
+            daily_rets.append(scaled_ret)
+
+        match_daily_returns[mi] = daily_rets
 
     if not forward_returns_by_day:
         return
@@ -623,20 +661,28 @@ def _build_event_forecast(similarity_results, current_price, ticker, start_date=
         try:
             actual_df = dp.get_daily_ohlcv(ticker, event_date - timedelta(days=5), date.today())
             if not actual_df.empty:
-                # Find the event day (or nearest trading day at/after event_date)
                 event_ts = pd.Timestamp(event_date)
                 idx = actual_df.index.searchsorted(event_ts)
                 if idx < len(actual_df):
                     forecast_price = float(actual_df["Close"].iloc[idx])
                     forecast_start = actual_df.index[idx].date()
 
-                    # Build actuals dict for days after event
                     actuals = {}
                     for j in range(idx + 1, len(actual_df)):
                         d = actual_df.index[j].date()
                         actuals[d] = float(actual_df["Close"].iloc[j])
         except Exception as e:
             logger.warning(f"Could not fetch actuals for backtest: {e}")
+
+    # Pre-compute per-match cumulative projections from anchor price
+    match_cumulative: dict[int, list[float]] = {}
+    for mi, rets in match_daily_returns.items():
+        prices = []
+        p = forecast_price
+        for ret in rets:
+            p = p * (1 + ret / 100)
+            prices.append(p)
+        match_cumulative[mi] = prices
 
     forecast = []
     projected = forecast_price
@@ -647,12 +693,38 @@ def _build_event_forecast(similarity_results, current_price, ticker, start_date=
             break
         avg_ret = sum(ret * w for ret, w in entries) / total_weight
         projected = projected * (1 + avg_ret / 100)
-        forecast.append({
+
+        # Collect per-match cumulative prices for confidence bands
+        match_prices = []
+        for mi in match_cumulative:
+            if day - 1 < len(match_cumulative[mi]):
+                match_prices.append(match_cumulative[mi][day - 1])
+
+        entry_dict = {
             "day": day,
             "price": projected,
             "change_pct": avg_ret,
             "contributors": len(entries),
-        })
+        }
+
+        if len(match_prices) >= 2:
+            sorted_prices = sorted(match_prices)
+            entry_dict["low_25"] = float(np.percentile(sorted_prices, 25))
+            entry_dict["high_75"] = float(np.percentile(sorted_prices, 75))
+            entry_dict["low_min"] = float(sorted_prices[0])
+            entry_dict["high_max"] = float(sorted_prices[-1])
+
+            agree_count = sum(1 for ret, _ in entries if (ret >= 0) == (avg_ret >= 0))
+            entry_dict["agree_pct"] = agree_count / len(entries) * 100
+        else:
+            entry_dict["low_25"] = projected
+            entry_dict["high_75"] = projected
+            entry_dict["low_min"] = projected
+            entry_dict["high_max"] = projected
+            entry_dict["agree_pct"] = 100.0
+
+        entry_dict["confidence"] = max(FORECAST_CONF_FLOOR, 1.0 - FORECAST_CONF_DECAY * day)
+        forecast.append(entry_dict)
 
     if forecast:
         display_scan_forecast(forecast, ticker, forecast_price,
@@ -660,15 +732,33 @@ def _build_event_forecast(similarity_results, current_price, ticker, start_date=
 
 
 def _display_forecast(df, results, window_size: int, ticker: str):
-    """Build a weighted day-by-day price forecast from top matches' forward returns."""
+    """Build a weighted day-by-day price forecast from top matches' forward returns.
+
+    Uses quality-gated filtering, exponential score weighting, volatility scaling,
+    and per-match tracking for confidence bands.
+    """
     import pandas as pd
 
     current_price = float(df["Close"].iloc[-1])
 
-    # Collect forward daily returns for each match, weighted by composite score
-    forward_returns_by_day: dict[int, list[tuple[float, float]]] = {}  # day -> [(return, weight)]
+    # Compute current volatility from recent window
+    recent = df.iloc[-window_size:]
+    current_vol = None
+    if len(recent) > 1:
+        recent_rets = recent["Close"].pct_change().dropna().values
+        if len(recent_rets) > 0:
+            current_vol = float(np.std(recent_rets))
 
-    for r in results:
+    # Quality gate
+    sorted_results = sorted(results, key=lambda s: s.composite_score, reverse=True)
+    quality = [r for r in sorted_results if r.composite_score >= FORECAST_MIN_SCORE]
+    if len(quality) < FORECAST_MIN_MATCHES:
+        quality = sorted_results[:FORECAST_FALLBACK_N]
+
+    forward_returns_by_day: dict[int, list[tuple[float, float]]] = {}
+    match_daily_returns: dict[int, list[float]] = {}
+
+    for mi, r in enumerate(quality):
         if r.event_date is None:
             continue
         match_start_idx = df.index.searchsorted(pd.Timestamp(r.event_date))
@@ -678,22 +768,48 @@ def _display_forecast(df, results, window_size: int, ticker: str):
             continue
 
         end_price = float(df["Close"].iloc[match_end_idx - 1])
-        weight = r.composite_score
+        weight = r.composite_score ** 2  # Exponential weighting
+
+        # Historical volatility from match window
+        match_window = df.iloc[match_start_idx:match_end_idx]
+        hist_vol = None
+        if len(match_window) > 1:
+            match_rets = match_window["Close"].pct_change().dropna().values
+            if len(match_rets) > 0:
+                hist_vol = float(np.std(match_rets))
+
+        vol_ratio = 1.0
+        if current_vol is not None and hist_vol is not None and hist_vol > 0:
+            vol_ratio = max(0.5, min(2.0, current_vol / hist_vol))
 
         prev_price = end_price
+        daily_rets = []
         for d in range(1, window_size + 1):
             fwd_idx = match_end_idx + d - 1
             if fwd_idx >= len(df):
                 break
             fwd_price = float(df["Close"].iloc[fwd_idx])
             daily_ret = (fwd_price / prev_price - 1) * 100
-            forward_returns_by_day.setdefault(d, []).append((daily_ret, weight))
+            scaled_ret = daily_ret * vol_ratio
+            forward_returns_by_day.setdefault(d, []).append((scaled_ret, weight))
+            daily_rets.append(scaled_ret)
             prev_price = fwd_price
+
+        match_daily_returns[mi] = daily_rets
 
     if not forward_returns_by_day:
         return
 
-    # Build forecast: weighted average return per day, applied sequentially
+    # Pre-compute per-match cumulative projections
+    match_cumulative: dict[int, list[float]] = {}
+    for mi, rets in match_daily_returns.items():
+        prices = []
+        p = current_price
+        for ret in rets:
+            p = p * (1 + ret / 100)
+            prices.append(p)
+        match_cumulative[mi] = prices
+
     forecast = []
     projected = current_price
     for day in sorted(forward_returns_by_day.keys()):
@@ -701,14 +817,39 @@ def _display_forecast(df, results, window_size: int, ticker: str):
         total_weight = sum(w for _, w in entries)
         if total_weight == 0:
             break
-        avg_ret = sum(r * w for r, w in entries) / total_weight
+        avg_ret = sum(ret * w for ret, w in entries) / total_weight
         projected = projected * (1 + avg_ret / 100)
-        forecast.append({
+
+        match_prices = []
+        for mi in match_cumulative:
+            if day - 1 < len(match_cumulative[mi]):
+                match_prices.append(match_cumulative[mi][day - 1])
+
+        entry_dict = {
             "day": day,
             "price": projected,
             "change_pct": avg_ret,
             "contributors": len(entries),
-        })
+        }
+
+        if len(match_prices) >= 2:
+            sorted_prices = sorted(match_prices)
+            entry_dict["low_25"] = float(np.percentile(sorted_prices, 25))
+            entry_dict["high_75"] = float(np.percentile(sorted_prices, 75))
+            entry_dict["low_min"] = float(sorted_prices[0])
+            entry_dict["high_max"] = float(sorted_prices[-1])
+
+            agree_count = sum(1 for ret, _ in entries if (ret >= 0) == (avg_ret >= 0))
+            entry_dict["agree_pct"] = agree_count / len(entries) * 100
+        else:
+            entry_dict["low_25"] = projected
+            entry_dict["high_75"] = projected
+            entry_dict["low_min"] = projected
+            entry_dict["high_max"] = projected
+            entry_dict["agree_pct"] = 100.0
+
+        entry_dict["confidence"] = max(FORECAST_CONF_FLOOR, 1.0 - FORECAST_CONF_DECAY * day)
+        forecast.append(entry_dict)
 
     if forecast:
         last_date = df.index[-1].date() if hasattr(df.index[-1], "date") else df.index[-1]
@@ -844,10 +985,12 @@ def export(ticker, event_type, output, days_before, days_after, event_ticker, pr
     if similarity_results:
         console.print()
         current_price = float(target_window["Close"].iloc[-1])
+        _tw_rets = target_window["Close"].pct_change().dropna().values
+        _current_vol = float(np.std(_tw_rets)) if len(_tw_rets) > 0 else None
         anchor_date = _find_backtest_anchor(catalog, category)
         _build_event_forecast(similarity_results, current_price, ticker,
                           start_date=target_window.index[-1].date(),
-                          event_date=anchor_date, dp=dp)
+                          event_date=anchor_date, dp=dp, current_vol=_current_vol)
 
     export_data = export_for_agent(profile, sr_levels, target_window, volume_price=vp_profile)
 
@@ -979,10 +1122,12 @@ def interactive(provider, verbose):
         # Day-by-day forecast
         console.print()
         current_price = float(target_window["Close"].iloc[-1])
+        _tw_rets = target_window["Close"].pct_change().dropna().values
+        _current_vol = float(np.std(_tw_rets)) if len(_tw_rets) > 0 else None
         anchor_date = _find_backtest_anchor(catalog, category)
         _build_event_forecast(similarity_results, current_price, ticker,
                           start_date=target_window.index[-1].date(),
-                          event_date=anchor_date, dp=dp)
+                          event_date=anchor_date, dp=dp, current_vol=_current_vol)
 
     # Export option
     if Prompt.ask("\n[bold]Export to JSON?", choices=["y", "n"], default="n") == "y":
