@@ -216,9 +216,27 @@ def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
     windows = []
     similarity_results = []
 
+    # Exclude events that fall inside the target window (avoid self-comparison)
+    tw_start = target_window.index[0].date()
+    tw_end = target_window.index[-1].date()
+    compare_events = [e for e in events if not (tw_start <= e.date <= tw_end)]
+    skipped = len(events) - len(compare_events)
+    if skipped:
+        console.print(f"  Skipped {skipped} current event(s) (inside target window {tw_start}–{tw_end})")
+
+    # If regime filter + self-exclusion left no events, fall back to all historical events
+    if not compare_events:
+        if regime_filter:
+            all_events = catalog.search(category=category, ticker=search_ticker)
+            compare_events = [e for e in all_events if not (tw_start <= e.date <= tw_end)]
+            console.print(f"  [yellow]No other events in current regime — comparing against all {len(compare_events)} historical events[/yellow]\n")
+        else:
+            console.print("[red]No historical events to compare against.[/red]")
+            return
+
     with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}")) as progress:
-        task = progress.add_task("Comparing events...", total=len(events))
-        for event in events:
+        task = progress.add_task("Comparing events...", total=len(compare_events))
+        for event in compare_events:
             progress.update(task, description=f"Analyzing {event.name}...")
             try:
                 hist_window = fetch_event_window(dp, ticker, event.date, days_before, days_after)
