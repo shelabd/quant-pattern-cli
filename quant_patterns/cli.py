@@ -106,6 +106,284 @@ def _find_backtest_anchor(catalog: EventCatalog, category: EventCategory,
     return None
 
 
+def _build_forecast_from_returns(
+    forward_returns_by_day: dict[int, list[tuple[float, float]]],
+    match_daily_returns: dict[int, list[float]],
+    anchor_price: float,
+    ticker: str,
+    start_date: date | None,
+    actuals: dict | None = None,
+) -> None:
+    """Build day-by-day forecast entries from pre-computed returns and display them."""
+    match_cumulative: dict[int, list[float]] = {}
+    for mi, rets in match_daily_returns.items():
+        prices = []
+        p = anchor_price
+        for ret in rets:
+            p = p * (1 + ret / 100)
+            prices.append(p)
+        match_cumulative[mi] = prices
+
+    forecast = []
+    projected = anchor_price
+    for day in sorted(forward_returns_by_day.keys()):
+        entries = forward_returns_by_day[day]
+        total_weight = sum(w for _, w in entries)
+        if total_weight == 0:
+            break
+        avg_ret = sum(ret * w for ret, w in entries) / total_weight
+        projected = projected * (1 + avg_ret / 100)
+
+        match_prices = []
+        for mi in match_cumulative:
+            if day - 1 < len(match_cumulative[mi]):
+                match_prices.append(match_cumulative[mi][day - 1])
+
+        entry_dict = {
+            "day": day,
+            "price": projected,
+            "change_pct": avg_ret,
+            "contributors": len(entries),
+        }
+
+        if len(match_prices) >= 2:
+            sorted_prices = sorted(match_prices)
+            entry_dict["low_25"] = float(np.percentile(sorted_prices, 25))
+            entry_dict["high_75"] = float(np.percentile(sorted_prices, 75))
+            entry_dict["low_min"] = float(sorted_prices[0])
+            entry_dict["high_max"] = float(sorted_prices[-1])
+
+            agree_count = sum(1 for ret, _ in entries if (ret >= 0) == (avg_ret >= 0))
+            entry_dict["agree_pct"] = agree_count / len(entries) * 100
+        else:
+            entry_dict["low_25"] = projected
+            entry_dict["high_75"] = projected
+            entry_dict["low_min"] = projected
+            entry_dict["high_max"] = projected
+            entry_dict["agree_pct"] = 100.0
+
+        entry_dict["confidence"] = max(FORECAST_CONF_FLOOR, 1.0 - FORECAST_CONF_DECAY * day)
+        forecast.append(entry_dict)
+
+    if forecast:
+        display_scan_forecast(forecast, ticker, anchor_price,
+                              start_date=start_date, actuals=actuals)
+
+
+def _compare_events(
+    dp: DataProvider,
+    ticker: str,
+    target_norm,
+    events: list[MarketEvent],
+    days_before: int,
+    days_after: int,
+) -> tuple[list, list]:
+    """Fetch historical windows and compare each to the target. Returns (windows, similarity_results)."""
+    windows = []
+    similarity_results = []
+
+    with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}")) as progress:
+        task = progress.add_task("Comparing events...", total=len(events))
+        for event in events:
+            progress.update(task, description=f"Analyzing {event.name}...")
+            try:
+                hist_window = fetch_event_window(dp, ticker, event.date, days_before, days_after)
+                hist_norm = normalize_window(hist_window)
+                windows.append(hist_window)
+
+                result = compare_windows(
+                    target_norm, hist_norm,
+                    event_name=event.name,
+                    event_date=event.date,
+                )
+                result.window_data = hist_norm
+                similarity_results.append(result)
+            except Exception as e:
+                logger.warning(f"Skipping {event.name}: {e}")
+            progress.advance(task)
+
+    return windows, similarity_results
+
+
+def _fetch_target_window(
+    dp: DataProvider,
+    ticker: str,
+    t_date: date,
+    days_before: int,
+    days_after: int,
+) -> Optional[tuple]:
+    """Fetch and normalize the target window. Returns (target_window, target_norm) or None on error."""
+    with Progress(SpinnerColumn(), TextColumn("[bold blue]Fetching target window...")) as progress:
+        progress.add_task("fetch", total=None)
+        try:
+            target_window = fetch_event_window(dp, ticker, t_date, days_before, days_after)
+            target_norm = normalize_window(target_window)
+        except Exception as e:
+            console.print(f"[red]Error fetching target data: {e}[/red]")
+            return None
+
+    console.print(f"\n  Target window: {target_window.index[0].date()} → {target_window.index[-1].date()}")
+    console.print(f"  {len(target_window)} trading days, current close: ${target_window['Close'].iloc[-1]:.2f}\n")
+    return target_window, target_norm
+
+
+def _compute_sr_levels(
+    dp: DataProvider,
+    ticker: str,
+    t_date: date,
+    target_window,
+) -> list:
+    """Fetch 180-day context, compute S/R levels, display chart. Returns levels (empty on error)."""
+    try:
+        broad_start = t_date - timedelta(days=180)
+        broad_df = dp.get_daily_ohlcv(ticker, broad_start, t_date)
+        sr_levels = find_support_resistance(broad_df)
+        current_price = target_window["Close"].iloc[-1]
+        display_support_resistance(sr_levels, current_price=current_price)
+
+        chart = ascii_price_chart(
+            target_window,
+            title=f"{ticker} Price (Target Window)",
+            support_resistance=sr_levels,
+        )
+        console.print(f"\n{chart}\n")
+        return sr_levels
+    except Exception as e:
+        logger.warning(f"S/R analysis error: {e}")
+        return []
+
+
+def _compute_volume_price(
+    target_window,
+    ticker: str,
+    show_daily: bool = True,
+):
+    """Compute and display volume-price profile. Returns the profile or None."""
+    vp_profile = analyze_volume_price(target_window)
+    if vp_profile:
+        vp_profile.ticker = ticker
+        display_volume_price_profile(vp_profile, show_daily=show_daily)
+    return vp_profile
+
+
+def _run_event_forecast(
+    similarity_results: list,
+    target_window,
+    ticker: str,
+    catalog: EventCatalog,
+    category: EventCategory,
+    dp: DataProvider,
+) -> None:
+    """Compute current vol, find backtest anchor, and run _build_event_forecast."""
+    current_price = float(target_window["Close"].iloc[-1])
+    _tw_rets = target_window["Close"].pct_change().dropna().values
+    _current_vol = float(np.std(_tw_rets)) if len(_tw_rets) > 0 else None
+    anchor_date = _find_backtest_anchor(catalog, category)
+    _build_event_forecast(similarity_results, current_price, ticker,
+                          start_date=target_window.index[-1].date(),
+                          event_date=anchor_date, dp=dp, current_vol=_current_vol)
+
+
+def _filter_events_by_regime(
+    dp: DataProvider,
+    ticker: str,
+    events: list[MarketEvent],
+    regime_lookback: int,
+) -> tuple[list[MarketEvent], Optional[object]]:
+    """Run HMM regime detection, filter events to current regime. Returns (events, regime_result)."""
+    from .regime import run_regime_detection, filter_events_by_regime
+
+    regime_result = None
+    console.print("  [bold]Detecting market regime...[/bold]")
+    try:
+        regime_result = run_regime_detection(dp, ticker, lookback_days=regime_lookback)
+        current_regime = regime_result.current_regime
+        console.print(f"  Current regime: [bold]{current_regime}[/bold]")
+
+        filtered = filter_events_by_regime(events, regime_result, current_regime)
+        if filtered:
+            console.print(f"  Filtered {len(events)} → {len(filtered)} events matching {current_regime}\n")
+            events = filtered
+        else:
+            console.print(f"  [yellow]No events in {current_regime} regime — using all events[/yellow]\n")
+    except Exception as e:
+        console.print(f"  [yellow]Regime detection failed ({e}), proceeding without filter[/yellow]\n")
+
+    return events, regime_result
+
+
+def _exclude_self_comparisons(
+    events: list[MarketEvent],
+    target_window,
+    catalog: EventCatalog,
+    category: EventCategory,
+    search_ticker: str,
+    regime_filter: bool,
+) -> Optional[list[MarketEvent]]:
+    """Filter out events inside target window date range. Returns filtered list or None if empty and no fallback."""
+    tw_start = target_window.index[0].date()
+    tw_end = target_window.index[-1].date()
+    compare_events = [e for e in events if not (tw_start <= e.date <= tw_end)]
+    skipped = len(events) - len(compare_events)
+    if skipped:
+        console.print(f"  Skipped {skipped} current event(s) (inside target window {tw_start}–{tw_end})")
+
+    if not compare_events:
+        if regime_filter:
+            all_events = catalog.search(category=category, ticker=search_ticker)
+            compare_events = [e for e in all_events if not (tw_start <= e.date <= tw_end)]
+            console.print(f"  [yellow]No other events in current regime — comparing against all {len(compare_events)} historical events[/yellow]\n")
+        else:
+            console.print("[red]No historical events to compare against.[/red]")
+            return None
+
+    return compare_events
+
+
+def _compute_regime_winrates(
+    regime_result: object,
+    catalog: EventCatalog,
+    category: EventCategory,
+    search_ticker: str,
+    similarity_results: list,
+    ticker: str,
+    event_type: str,
+) -> None:
+    """Compute and display per-regime win rates from similarity results."""
+    from .regime import get_regime_at_date
+
+    console.print()
+    all_category_events = catalog.search(category=category, ticker=search_ticker)
+    regime_winrates: dict[str, dict] = {}
+    for state in regime_result.states:
+        label = state.label
+        returns_in_regime = []
+        for event in all_category_events:
+            r_label = get_regime_at_date(regime_result, event.date)
+            if r_label != label:
+                continue
+            for sr in similarity_results:
+                if sr.event_date == event.date and sr.window_data is not None:
+                    wd = sr.window_data
+                    if "rel_day" in wd.columns:
+                        post = wd[wd["rel_day"] > 0]["Close"]
+                        ev = wd[wd["rel_day"] == 0]["Close"]
+                        if not ev.empty and len(post) >= 1:
+                            ret = (post.iloc[-1] / ev.values[0] - 1) * 100
+                            returns_in_regime.append(ret)
+                    break
+
+        if returns_in_regime:
+            win_count = sum(1 for r in returns_in_regime if r > 0)
+            regime_winrates[label] = {
+                "win_rate": win_count / len(returns_in_regime) * 100,
+                "avg_return": float(np.mean(returns_in_regime)),
+                "count": len(returns_in_regime),
+            }
+    if regime_winrates:
+        display_regime_conditional_winrates(ticker, event_type, regime_winrates)
+
+
 # ── CLI Group ───────────────────────────────────────────────────────────────────
 
 @click.group()
@@ -173,86 +451,27 @@ def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
     # Regime filtering
     regime_result = None
     if regime_filter:
-        from .regime import run_regime_detection, filter_events_by_regime
-
-        console.print("  [bold]Detecting market regime...[/bold]")
-        try:
-            regime_result = run_regime_detection(dp, ticker, lookback_days=regime_lookback)
-            current_regime = regime_result.current_regime
-            console.print(f"  Current regime: [bold]{current_regime}[/bold]")
-
-            filtered = filter_events_by_regime(events, regime_result, current_regime)
-            if filtered:
-                console.print(f"  Filtered {len(events)} → {len(filtered)} events matching {current_regime}\n")
-                events = filtered
-            else:
-                console.print(f"  [yellow]No events in {current_regime} regime — using all events[/yellow]\n")
-        except Exception as e:
-            console.print(f"  [yellow]Regime detection failed ({e}), proceeding without filter[/yellow]\n")
+        events, regime_result = _filter_events_by_regime(dp, ticker, events, regime_lookback)
 
     console.print(f"  Found {len(events)} relevant events\n")
     display_event_list(events)
 
     # Fetch target window (most recent behavior or specified date)
-    if target_date:
-        t_date = datetime.strptime(target_date, "%Y-%m-%d").date()
-    else:
-        t_date = date.today()
+    t_date = datetime.strptime(target_date, "%Y-%m-%d").date() if target_date else date.today()
 
-    with Progress(SpinnerColumn(), TextColumn("[bold blue]Fetching target window...")) as progress:
-        task = progress.add_task("fetch", total=None)
-        try:
-            # For target, get recent data leading up to target_date
-            target_window = fetch_event_window(dp, ticker, t_date, days_before, days_after)
-            target_norm = normalize_window(target_window)
-        except Exception as e:
-            console.print(f"[red]Error fetching target data: {e}[/red]")
-            return
+    result = _fetch_target_window(dp, ticker, t_date, days_before, days_after)
+    if result is None:
+        return
+    target_window, target_norm = result
 
-    console.print(f"\n  Target window: {target_window.index[0].date()} → {target_window.index[-1].date()}")
-    console.print(f"  {len(target_window)} trading days, current close: ${target_window['Close'].iloc[-1]:.2f}\n")
+    # Exclude self-comparisons
+    compare_events = _exclude_self_comparisons(events, target_window, catalog, category,
+                                                search_ticker, regime_filter)
+    if compare_events is None:
+        return
 
-    # Fetch and compare each historical event
-    windows = []
-    similarity_results = []
-
-    # Exclude events that fall inside the target window (avoid self-comparison)
-    tw_start = target_window.index[0].date()
-    tw_end = target_window.index[-1].date()
-    compare_events = [e for e in events if not (tw_start <= e.date <= tw_end)]
-    skipped = len(events) - len(compare_events)
-    if skipped:
-        console.print(f"  Skipped {skipped} current event(s) (inside target window {tw_start}–{tw_end})")
-
-    # If regime filter + self-exclusion left no events, fall back to all historical events
-    if not compare_events:
-        if regime_filter:
-            all_events = catalog.search(category=category, ticker=search_ticker)
-            compare_events = [e for e in all_events if not (tw_start <= e.date <= tw_end)]
-            console.print(f"  [yellow]No other events in current regime — comparing against all {len(compare_events)} historical events[/yellow]\n")
-        else:
-            console.print("[red]No historical events to compare against.[/red]")
-            return
-
-    with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}")) as progress:
-        task = progress.add_task("Comparing events...", total=len(compare_events))
-        for event in compare_events:
-            progress.update(task, description=f"Analyzing {event.name}...")
-            try:
-                hist_window = fetch_event_window(dp, ticker, event.date, days_before, days_after)
-                hist_norm = normalize_window(hist_window)
-                windows.append(hist_window)
-
-                result = compare_windows(
-                    target_norm, hist_norm,
-                    event_name=event.name,
-                    event_date=event.date,
-                )
-                result.window_data = hist_norm
-                similarity_results.append(result)
-            except Exception as e:
-                logger.warning(f"Skipping {event.name}: {e}")
-            progress.advance(task)
+    windows, similarity_results = _compare_events(dp, ticker, target_norm,
+                                                    compare_events, days_before, days_after)
 
     if not similarity_results:
         console.print("[red]No valid comparisons could be made.[/red]")
@@ -268,31 +487,11 @@ def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
 
     # S/R levels on target window with broader context
     console.print()
-    try:
-        # Get broader data for S/R
-        broad_start = t_date - timedelta(days=180)
-        broad_df = dp.get_daily_ohlcv(ticker, broad_start, t_date)
-        sr_levels = find_support_resistance(broad_df)
-        current_price = target_window["Close"].iloc[-1]
-        display_support_resistance(sr_levels, current_price=current_price)
-
-        # ASCII chart with S/R
-        chart = ascii_price_chart(
-            target_window,
-            title=f"{ticker} Price (Target Window)",
-            support_resistance=sr_levels,
-        )
-        console.print(f"\n{chart}\n")
-    except Exception as e:
-        logger.warning(f"S/R analysis error: {e}")
-        sr_levels = []
+    sr_levels = _compute_sr_levels(dp, ticker, t_date, target_window)
 
     # Volume-Price Authenticity
     console.print()
-    vp_profile = analyze_volume_price(target_window)
-    if vp_profile:
-        vp_profile.ticker = ticker
-        display_volume_price_profile(vp_profile, show_daily=True)
+    vp_profile = _compute_volume_price(target_window, ticker, show_daily=True)
 
     # Build and display profile
     profile = build_pattern_profile(ticker, event_type, windows, similarity_results)
@@ -300,49 +499,12 @@ def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
 
     # Regime-conditional win rates
     if regime_filter and regime_result is not None:
-        from .regime import get_regime_at_date
-
-        console.print()
-        all_category_events = catalog.search(category=category, ticker=search_ticker)
-        regime_winrates: dict[str, dict] = {}
-        for state in regime_result.states:
-            label = state.label
-            returns_in_regime = []
-            for event in all_category_events:
-                r_label = get_regime_at_date(regime_result, event.date)
-                if r_label != label:
-                    continue
-                # Look up return from already-computed similarity results or windows
-                for sr in similarity_results:
-                    if sr.event_date == event.date and sr.window_data is not None:
-                        wd = sr.window_data
-                        if "rel_day" in wd.columns:
-                            post = wd[wd["rel_day"] > 0]["Close"]
-                            ev = wd[wd["rel_day"] == 0]["Close"]
-                            if not ev.empty and len(post) >= 1:
-                                ret = (post.iloc[-1] / ev.values[0] - 1) * 100
-                                returns_in_regime.append(ret)
-                        break
-
-            if returns_in_regime:
-                win_count = sum(1 for r in returns_in_regime if r > 0)
-                regime_winrates[label] = {
-                    "win_rate": win_count / len(returns_in_regime) * 100,
-                    "avg_return": float(np.mean(returns_in_regime)),
-                    "count": len(returns_in_regime),
-                }
-        if regime_winrates:
-            display_regime_conditional_winrates(ticker, event_type, regime_winrates)
+        _compute_regime_winrates(regime_result, catalog, category, search_ticker,
+                                  similarity_results, ticker, event_type)
 
     # Day-by-day forecast
     console.print()
-    current_price = float(target_window["Close"].iloc[-1])
-    _tw_rets = target_window["Close"].pct_change().dropna().values
-    _current_vol = float(np.std(_tw_rets)) if len(_tw_rets) > 0 else None
-    anchor_date = _find_backtest_anchor(catalog, category)
-    _build_event_forecast(similarity_results, current_price, ticker,
-                          start_date=target_window.index[-1].date(),
-                          event_date=anchor_date, dp=dp, current_vol=_current_vol)
+    _run_event_forecast(similarity_results, target_window, ticker, catalog, category, dp)
 
     # Export
     if export_json:
@@ -757,61 +919,8 @@ def _build_event_forecast(similarity_results, current_price, ticker, start_date=
         except Exception as e:
             logger.warning(f"Could not fetch actuals for backtest: {e}")
 
-    # Pre-compute per-match cumulative projections from anchor price
-    match_cumulative: dict[int, list[float]] = {}
-    for mi, rets in match_daily_returns.items():
-        prices = []
-        p = forecast_price
-        for ret in rets:
-            p = p * (1 + ret / 100)
-            prices.append(p)
-        match_cumulative[mi] = prices
-
-    forecast = []
-    projected = forecast_price
-    for day in sorted(forward_returns_by_day.keys()):
-        entries = forward_returns_by_day[day]
-        total_weight = sum(w for _, w in entries)
-        if total_weight == 0:
-            break
-        avg_ret = sum(ret * w for ret, w in entries) / total_weight
-        projected = projected * (1 + avg_ret / 100)
-
-        # Collect per-match cumulative prices for confidence bands
-        match_prices = []
-        for mi in match_cumulative:
-            if day - 1 < len(match_cumulative[mi]):
-                match_prices.append(match_cumulative[mi][day - 1])
-
-        entry_dict = {
-            "day": day,
-            "price": projected,
-            "change_pct": avg_ret,
-            "contributors": len(entries),
-        }
-
-        if len(match_prices) >= 2:
-            sorted_prices = sorted(match_prices)
-            entry_dict["low_25"] = float(np.percentile(sorted_prices, 25))
-            entry_dict["high_75"] = float(np.percentile(sorted_prices, 75))
-            entry_dict["low_min"] = float(sorted_prices[0])
-            entry_dict["high_max"] = float(sorted_prices[-1])
-
-            agree_count = sum(1 for ret, _ in entries if (ret >= 0) == (avg_ret >= 0))
-            entry_dict["agree_pct"] = agree_count / len(entries) * 100
-        else:
-            entry_dict["low_25"] = projected
-            entry_dict["high_75"] = projected
-            entry_dict["low_min"] = projected
-            entry_dict["high_max"] = projected
-            entry_dict["agree_pct"] = 100.0
-
-        entry_dict["confidence"] = max(FORECAST_CONF_FLOOR, 1.0 - FORECAST_CONF_DECAY * day)
-        forecast.append(entry_dict)
-
-    if forecast:
-        display_scan_forecast(forecast, ticker, forecast_price,
-                              start_date=forecast_start, actuals=actuals)
+    _build_forecast_from_returns(forward_returns_by_day, match_daily_returns,
+                                  forecast_price, ticker, forecast_start, actuals)
 
 
 def _display_forecast(df, results, window_size: int, ticker: str):
@@ -883,60 +992,9 @@ def _display_forecast(df, results, window_size: int, ticker: str):
     if not forward_returns_by_day:
         return
 
-    # Pre-compute per-match cumulative projections
-    match_cumulative: dict[int, list[float]] = {}
-    for mi, rets in match_daily_returns.items():
-        prices = []
-        p = current_price
-        for ret in rets:
-            p = p * (1 + ret / 100)
-            prices.append(p)
-        match_cumulative[mi] = prices
-
-    forecast = []
-    projected = current_price
-    for day in sorted(forward_returns_by_day.keys()):
-        entries = forward_returns_by_day[day]
-        total_weight = sum(w for _, w in entries)
-        if total_weight == 0:
-            break
-        avg_ret = sum(ret * w for ret, w in entries) / total_weight
-        projected = projected * (1 + avg_ret / 100)
-
-        match_prices = []
-        for mi in match_cumulative:
-            if day - 1 < len(match_cumulative[mi]):
-                match_prices.append(match_cumulative[mi][day - 1])
-
-        entry_dict = {
-            "day": day,
-            "price": projected,
-            "change_pct": avg_ret,
-            "contributors": len(entries),
-        }
-
-        if len(match_prices) >= 2:
-            sorted_prices = sorted(match_prices)
-            entry_dict["low_25"] = float(np.percentile(sorted_prices, 25))
-            entry_dict["high_75"] = float(np.percentile(sorted_prices, 75))
-            entry_dict["low_min"] = float(sorted_prices[0])
-            entry_dict["high_max"] = float(sorted_prices[-1])
-
-            agree_count = sum(1 for ret, _ in entries if (ret >= 0) == (avg_ret >= 0))
-            entry_dict["agree_pct"] = agree_count / len(entries) * 100
-        else:
-            entry_dict["low_25"] = projected
-            entry_dict["high_75"] = projected
-            entry_dict["low_min"] = projected
-            entry_dict["high_max"] = projected
-            entry_dict["agree_pct"] = 100.0
-
-        entry_dict["confidence"] = max(FORECAST_CONF_FLOOR, 1.0 - FORECAST_CONF_DECAY * day)
-        forecast.append(entry_dict)
-
-    if forecast:
-        last_date = df.index[-1].date() if hasattr(df.index[-1], "date") else df.index[-1]
-        display_scan_forecast(forecast, ticker, current_price, start_date=last_date)
+    last_date = df.index[-1].date() if hasattr(df.index[-1], "date") else df.index[-1]
+    _build_forecast_from_returns(forward_returns_by_day, match_daily_returns,
+                                  current_price, ticker, last_date)
 
 
 # ── EVENTS command ──────────────────────────────────────────────────────────────
@@ -1034,46 +1092,22 @@ def export(ticker, event_type, output, days_before, days_after, event_ticker, pr
     target_window = fetch_event_window(dp, ticker, t_date, days_before, days_after)
     target_norm = normalize_window(target_window)
 
-    windows = []
-    similarity_results = []
+    windows, similarity_results = _compare_events(dp, ticker, target_norm,
+                                                    events_list, days_before, days_after)
 
-    with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}")) as progress:
-        task = progress.add_task("Processing...", total=len(events_list))
-        for event in events_list:
-            progress.update(task, description=f"Processing {event.name}...")
-            try:
-                hw = fetch_event_window(dp, ticker, event.date, days_before, days_after)
-                hn = normalize_window(hw)
-                windows.append(hw)
-                result = compare_windows(target_norm, hn, event.name, event.date)
-                result.window_data = hn
-                similarity_results.append(result)
-            except Exception as e:
-                logger.warning(f"Skipping {event.name}: {e}")
-            progress.advance(task)
-
-    # S/R
+    # S/R (no try/except — let errors propagate in export)
     broad_df = dp.get_daily_ohlcv(ticker, t_date - timedelta(days=180), t_date)
     sr_levels = find_support_resistance(broad_df)
 
     profile = build_pattern_profile(ticker, event_type, windows, similarity_results)
 
     # Volume-Price Authenticity
-    vp_profile = analyze_volume_price(target_window)
-    if vp_profile:
-        vp_profile.ticker = ticker
-        display_volume_price_profile(vp_profile, show_daily=False)
+    vp_profile = _compute_volume_price(target_window, ticker, show_daily=False)
 
     # Day-by-day forecast
     if similarity_results:
         console.print()
-        current_price = float(target_window["Close"].iloc[-1])
-        _tw_rets = target_window["Close"].pct_change().dropna().values
-        _current_vol = float(np.std(_tw_rets)) if len(_tw_rets) > 0 else None
-        anchor_date = _find_backtest_anchor(catalog, category)
-        _build_event_forecast(similarity_results, current_price, ticker,
-                          start_date=target_window.index[-1].date(),
-                          event_date=anchor_date, dp=dp, current_vol=_current_vol)
+        _run_event_forecast(similarity_results, target_window, ticker, catalog, category, dp)
 
     export_data = export_for_agent(profile, sr_levels, target_window, volume_price=vp_profile)
 
@@ -1160,23 +1194,8 @@ def interactive(provider, verbose):
         console.print(f"[red]Error fetching target: {e}[/red]")
         return
 
-    windows = []
-    similarity_results = []
-
-    with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}")) as progress:
-        task = progress.add_task("Comparing...", total=len(events_list))
-        for event in events_list:
-            progress.update(task, description=f"{event.name}...")
-            try:
-                hw = fetch_event_window(dp, ticker, event.date, days_before, days_after)
-                hn = normalize_window(hw)
-                windows.append(hw)
-                r = compare_windows(target_norm, hn, event.name, event.date)
-                r.window_data = hn
-                similarity_results.append(r)
-            except Exception:
-                pass
-            progress.advance(task)
+    windows, similarity_results = _compare_events(dp, ticker, target_norm,
+                                                    events_list, days_before, days_after)
 
     if similarity_results:
         display_similarity_results(similarity_results, top_n=len(similarity_results))
@@ -1184,19 +1203,11 @@ def interactive(provider, verbose):
         display_comparison_chart(target_norm, top, max_overlays=3)
 
     # S/R
-    try:
-        broad_df = dp.get_daily_ohlcv(ticker, t_date - timedelta(days=180), t_date)
-        sr_levels = find_support_resistance(broad_df)
-        display_support_resistance(sr_levels, target_window["Close"].iloc[-1])
-    except Exception:
-        sr_levels = []
+    sr_levels = _compute_sr_levels(dp, ticker, t_date, target_window)
 
     # Volume-Price Authenticity
     console.print()
-    vp_profile = analyze_volume_price(target_window)
-    if vp_profile:
-        vp_profile.ticker = ticker
-        display_volume_price_profile(vp_profile, show_daily=True)
+    vp_profile = _compute_volume_price(target_window, ticker, show_daily=True)
 
     if windows and similarity_results:
         profile = build_pattern_profile(ticker, cat_choice, windows, similarity_results)
@@ -1204,13 +1215,7 @@ def interactive(provider, verbose):
 
         # Day-by-day forecast
         console.print()
-        current_price = float(target_window["Close"].iloc[-1])
-        _tw_rets = target_window["Close"].pct_change().dropna().values
-        _current_vol = float(np.std(_tw_rets)) if len(_tw_rets) > 0 else None
-        anchor_date = _find_backtest_anchor(catalog, category)
-        _build_event_forecast(similarity_results, current_price, ticker,
-                          start_date=target_window.index[-1].date(),
-                          event_date=anchor_date, dp=dp, current_vol=_current_vol)
+        _run_event_forecast(similarity_results, target_window, ticker, catalog, category, dp)
 
     # Export option
     if Prompt.ask("\n[bold]Export to JSON?", choices=["y", "n"], default="n") == "y":
