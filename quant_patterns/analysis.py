@@ -622,6 +622,307 @@ def analyze_volume_price(
     )
 
 
+# ── Volume Profile & Anchored VWAP ────────────────────────────────────────────
+
+@dataclass
+class VolumeProfileBin:
+    """Single price bin in the volume profile."""
+    price_low: float
+    price_high: float
+    price_mid: float
+    volume: float
+    pct_of_total: float  # 0-100
+
+
+@dataclass
+class AnchoredVWAP:
+    """An anchored VWAP from a specific date."""
+    anchor_label: str
+    anchor_date: date
+    vwap_price: float
+    distance_pct: float  # % distance from current price
+
+
+@dataclass
+class VolumeProfile:
+    """Complete volume profile analysis."""
+    ticker: str
+    start_date: date
+    end_date: date
+    current_price: float
+    num_bins: int
+    bins: list[VolumeProfileBin]
+    poc_price: float          # Point of Control — highest volume price
+    poc_volume: float
+    poc_distance_pct: float   # % distance from current price
+    vah_price: float          # Value Area High (top of 70% volume zone)
+    val_price: float          # Value Area Low (bottom of 70% volume zone)
+    anchored_vwaps: list[AnchoredVWAP]
+    signal: str               # Textual signal interpretation
+    position: str             # "above_vah", "in_value_area", "below_val"
+
+    def to_dict(self) -> dict:
+        return {
+            "ticker": self.ticker,
+            "start_date": self.start_date.isoformat(),
+            "end_date": self.end_date.isoformat(),
+            "current_price": round(self.current_price, 2),
+            "poc": {"price": round(self.poc_price, 2),
+                    "distance_pct": round(self.poc_distance_pct, 2)},
+            "value_area": {"high": round(self.vah_price, 2),
+                           "low": round(self.val_price, 2)},
+            "anchored_vwaps": [
+                {"label": v.anchor_label, "date": v.anchor_date.isoformat(),
+                 "price": round(v.vwap_price, 2),
+                 "distance_pct": round(v.distance_pct, 2)}
+                for v in self.anchored_vwaps
+            ],
+            "signal": self.signal,
+            "position": self.position,
+        }
+
+
+def compute_volume_profile(
+    df: pd.DataFrame,
+    num_bins: int = 100,
+) -> tuple[list[VolumeProfileBin], float, float, float, float]:
+    """
+    Build volume profile by distributing volume across price bins.
+
+    Uses typical price (H+L+C)/3 per bar to assign that bar's volume to a bin.
+
+    Returns: (bins, poc_price, vah_price, val_price, total_volume)
+    """
+    if df.empty or len(df) < 2:
+        return [], 0.0, 0.0, 0.0, 0.0
+
+    typical = (df["High"] + df["Low"] + df["Close"]) / 3
+    volumes = df["Volume"].values
+
+    price_min = float(typical.min())
+    price_max = float(typical.max())
+    price_range = price_max - price_min
+    if price_range == 0:
+        return [], price_min, price_min, price_min, 0.0
+
+    bin_size = price_range / num_bins
+    bin_volumes = np.zeros(num_bins)
+
+    for tp, vol in zip(typical.values, volumes):
+        idx = int((tp - price_min) / bin_size)
+        idx = min(idx, num_bins - 1)
+        bin_volumes[idx] += vol
+
+    total_volume = float(np.sum(bin_volumes))
+    if total_volume == 0:
+        return [], price_min, price_max, price_min, 0.0
+
+    # Build bin objects
+    bins = []
+    for i in range(num_bins):
+        low = price_min + i * bin_size
+        high = low + bin_size
+        bins.append(VolumeProfileBin(
+            price_low=low,
+            price_high=high,
+            price_mid=(low + high) / 2,
+            volume=float(bin_volumes[i]),
+            pct_of_total=float(bin_volumes[i] / total_volume * 100),
+        ))
+
+    # POC = bin with highest volume
+    poc_idx = int(np.argmax(bin_volumes))
+    poc_price = bins[poc_idx].price_mid
+
+    # Value Area: 70% of total volume centered around POC
+    # Expand outward from POC bin until 70% is captured
+    va_volume = bin_volumes[poc_idx]
+    lo, hi = poc_idx, poc_idx
+    target = total_volume * 0.70
+
+    while va_volume < target and (lo > 0 or hi < num_bins - 1):
+        expand_lo = bin_volumes[lo - 1] if lo > 0 else 0
+        expand_hi = bin_volumes[hi + 1] if hi < num_bins - 1 else 0
+
+        if expand_lo >= expand_hi and lo > 0:
+            lo -= 1
+            va_volume += bin_volumes[lo]
+        elif hi < num_bins - 1:
+            hi += 1
+            va_volume += bin_volumes[hi]
+        elif lo > 0:
+            lo -= 1
+            va_volume += bin_volumes[lo]
+        else:
+            break
+
+    val_price = bins[lo].price_low
+    vah_price = bins[hi].price_high
+
+    return bins, poc_price, vah_price, val_price, total_volume
+
+
+def _find_swing_point(df: pd.DataFrame, window: int = 20) -> Optional[tuple[date, str]]:
+    """Find the most recent significant swing high or low."""
+    if len(df) < window * 2:
+        return None
+
+    close = df["Close"].values
+    dates = df.index
+
+    # Check last portion for swing points
+    for i in range(len(close) - window, window - 1, -1):
+        segment = close[max(0, i - window):i + window + 1]
+        mid = close[i]
+        if mid == np.max(segment):
+            dt = dates[i].date() if hasattr(dates[i], "date") else dates[i]
+            return (dt, "swing high")
+        if mid == np.min(segment):
+            dt = dates[i].date() if hasattr(dates[i], "date") else dates[i]
+            return (dt, "swing low")
+
+    return None
+
+
+def compute_anchored_vwap(
+    df: pd.DataFrame,
+    anchor_date: date,
+) -> Optional[float]:
+    """
+    Compute VWAP anchored from a specific date.
+
+    VWAP = cumsum(typical_price * volume) / cumsum(volume) from anchor forward.
+    """
+    anchor_ts = pd.Timestamp(anchor_date)
+    mask = df.index >= anchor_ts
+    subset = df[mask]
+
+    if subset.empty or len(subset) < 1:
+        return None
+
+    typical = (subset["High"] + subset["Low"] + subset["Close"]) / 3
+    cum_tp_vol = (typical * subset["Volume"]).cumsum()
+    cum_vol = subset["Volume"].cumsum()
+
+    # Avoid division by zero
+    if cum_vol.iloc[-1] == 0:
+        return None
+
+    vwap_series = cum_tp_vol / cum_vol
+    return float(vwap_series.iloc[-1])
+
+
+def build_volume_profile(
+    df: pd.DataFrame,
+    ticker: str,
+    num_bins: int = 100,
+    anchor_dates: Optional[list[tuple[str, date]]] = None,
+) -> Optional[VolumeProfile]:
+    """
+    Build complete volume profile with anchored VWAPs.
+
+    Args:
+        df: OHLCV DataFrame
+        ticker: Ticker symbol
+        num_bins: Number of price bins
+        anchor_dates: List of (label, date) tuples for AVWAP computation
+    """
+    if df.empty or len(df) < 5:
+        return None
+
+    current_price = float(df["Close"].iloc[-1])
+    start_dt = df.index[0].date() if hasattr(df.index[0], "date") else df.index[0]
+    end_dt = df.index[-1].date() if hasattr(df.index[-1], "date") else df.index[-1]
+
+    bins, poc_price, vah_price, val_price, total_vol = compute_volume_profile(df, num_bins)
+    if not bins:
+        return None
+
+    poc_distance = ((current_price - poc_price) / poc_price) * 100
+
+    # Compute anchored VWAPs
+    avwaps: list[AnchoredVWAP] = []
+    if anchor_dates:
+        for label, adate in anchor_dates:
+            vwap_val = compute_anchored_vwap(df, adate)
+            if vwap_val is not None:
+                dist = ((current_price - vwap_val) / vwap_val) * 100
+                avwaps.append(AnchoredVWAP(
+                    anchor_label=label,
+                    anchor_date=adate,
+                    vwap_price=vwap_val,
+                    distance_pct=dist,
+                ))
+
+    # Determine position relative to value area
+    if current_price > vah_price:
+        position = "above_vah"
+    elif current_price < val_price:
+        position = "below_val"
+    else:
+        position = "in_value_area"
+
+    # Generate signal
+    signal = _generate_vprofile_signal(current_price, poc_price, vah_price, val_price, avwaps)
+
+    return VolumeProfile(
+        ticker=ticker,
+        start_date=start_dt,
+        end_date=end_dt,
+        current_price=current_price,
+        num_bins=num_bins,
+        bins=bins,
+        poc_price=poc_price,
+        poc_volume=max(b.volume for b in bins),
+        poc_distance_pct=poc_distance,
+        vah_price=vah_price,
+        val_price=val_price,
+        anchored_vwaps=avwaps,
+        signal=signal,
+        position=position,
+    )
+
+
+def _generate_vprofile_signal(
+    price: float, poc: float, vah: float, val: float,
+    avwaps: list[AnchoredVWAP],
+) -> str:
+    """Generate a textual signal from volume profile positioning."""
+    parts = []
+
+    # Price vs value area
+    if price > vah:
+        parts.append(f"Price ${price:.2f} is ABOVE Value Area High ${vah:.2f}")
+        parts.append("Breakout territory — watch for acceptance or rejection back into value")
+    elif price < val:
+        parts.append(f"Price ${price:.2f} is BELOW Value Area Low ${val:.2f}")
+        parts.append("Breakdown territory — watch for acceptance lower or snap-back into value")
+    else:
+        parts.append(f"Price ${price:.2f} is INSIDE Value Area (${val:.2f} - ${vah:.2f})")
+        parts.append("Range-bound — POC acts as mean-reversion magnet")
+
+    # Price vs POC
+    poc_dist = abs(price - poc) / poc * 100
+    if poc_dist < 0.5:
+        parts.append(f"Price is AT the POC ${poc:.2f} — strongest volume node")
+    elif price > poc:
+        parts.append(f"Price is {poc_dist:.1f}% above POC ${poc:.2f} — gravity pull lower")
+    else:
+        parts.append(f"Price is {poc_dist:.1f}% below POC ${poc:.2f} — gravity pull higher")
+
+    # AVWAP signals
+    above_count = sum(1 for v in avwaps if price > v.vwap_price)
+    if avwaps:
+        if above_count == len(avwaps):
+            parts.append("Price above ALL anchored VWAPs — bullish institutional positioning")
+        elif above_count == 0:
+            parts.append("Price below ALL anchored VWAPs — bearish institutional positioning")
+        else:
+            parts.append(f"Price above {above_count}/{len(avwaps)} anchored VWAPs — mixed positioning")
+
+    return " | ".join(parts)
+
+
 # ── Quant Agent Export ──────────────────────────────────────────────────────────
 
 def export_for_agent(

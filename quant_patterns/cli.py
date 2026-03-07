@@ -27,10 +27,12 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from .analysis import (
     analyze_volume_price,
     build_pattern_profile,
+    build_volume_profile,
     compare_windows,
     export_for_agent,
     find_support_resistance,
     sliding_window_scan,
+    _find_swing_point,
 )
 from .data import (
     DataProvider,
@@ -57,6 +59,7 @@ from .display import (
     display_support_resistance,
     display_ticker_info,
     display_volume_price_profile,
+    display_volume_profile,
 )
 from .events import EventCatalog, EventCategory, MarketEvent
 
@@ -650,6 +653,125 @@ def sr(ticker, lookback, levels, window, provider, verbose):
         support_resistance=sr_levels,
     )
     console.print(chart)
+
+
+# ── VPROFILE command ──────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("ticker")
+@click.option("--lookback", "-l", default=60, help="Lookback period in trading days")
+@click.option("--bins", "-b", default=100, help="Number of price bins for volume profile")
+@click.option("--event", "-e", default=None, type=click.Choice(
+    [c.value for c in EventCategory], case_sensitive=False),
+    help="Event category for anchored VWAP (e.g. earnings, fomc)")
+@common_options
+def vprofile(ticker, lookback, bins, event, provider, verbose):
+    """
+    Volume Profile & Anchored VWAP analysis for TICKER.
+
+    Shows where volume actually traded across price levels, identifies the
+    Point of Control (POC), Value Area (70% zone), and computes anchored
+    VWAPs from key dates (YTD open, last earnings/event, last swing point).
+
+    Examples:
+
+      qpat vprofile SPY
+
+      qpat vprofile NVDA --lookback 120 --bins 150
+
+      qpat vprofile AAPL -e earnings
+    """
+    setup_logging(verbose)
+    ticker = ticker.upper()
+    dp = get_data_provider(provider)
+
+    end = date.today()
+    # Use calendar days with buffer for lookback trading days
+    start = end - timedelta(days=int(lookback * 1.5) + 15)
+
+    console.print(f"\n[bold cyan]Volume Profile: {ticker}[/bold cyan]")
+    console.print(f"  Lookback: ~{lookback} trading days  |  Bins: {bins}\n")
+
+    display_ticker_info(fetch_ticker_info(ticker))
+    console.print()
+
+    with Progress(SpinnerColumn(), TextColumn("[bold blue]Fetching data...")) as progress:
+        task = progress.add_task("fetch", total=None)
+        try:
+            df = dp.get_daily_ohlcv(ticker, start, end)
+        except Exception as e:
+            console.print(f"[red]Error: {e}[/red]")
+            return
+
+    # Trim to requested lookback trading days
+    if len(df) > lookback:
+        df = df.iloc[-lookback:]
+
+    # Build anchor dates for AVWAP
+    anchor_dates: list[tuple[str, date]] = []
+
+    # 1. YTD open
+    ytd_start = date(end.year, 1, 1)
+    if df.index[0].date() <= ytd_start if hasattr(df.index[0], "date") else df.index[0] <= ytd_start:
+        anchor_dates.append(("YTD Open", ytd_start))
+    else:
+        # Use start of data as fallback
+        first_dt = df.index[0].date() if hasattr(df.index[0], "date") else df.index[0]
+        anchor_dates.append(("Period Start", first_dt))
+
+    # 2. Last event from catalog (earnings, FOMC, etc.)
+    catalog = EventCatalog()
+    if event:
+        cat = EventCategory(event)
+        events = catalog.search(category=cat, ticker=ticker, end=end)
+        # Find the most recent one within our data range
+        data_start = df.index[0].date() if hasattr(df.index[0], "date") else df.index[0]
+        past_events = [e for e in events if data_start <= e.date <= end]
+        if past_events:
+            last_evt = past_events[-1]
+            anchor_dates.append((f"Last {cat.value.upper()}: {last_evt.name}", last_evt.date))
+    else:
+        # Auto-detect: try earnings first, then FOMC
+        for cat in [EventCategory.EARNINGS, EventCategory.FOMC]:
+            events = catalog.search(category=cat, ticker=ticker, end=end)
+            data_start = df.index[0].date() if hasattr(df.index[0], "date") else df.index[0]
+            past_events = [e for e in events if data_start <= e.date <= end]
+            if past_events:
+                last_evt = past_events[-1]
+                anchor_dates.append((f"Last {cat.value.upper()}: {last_evt.name}", last_evt.date))
+                break
+
+    # 3. Last major swing point
+    swing = _find_swing_point(df, window=10)
+    if swing:
+        swing_date, swing_type = swing
+        anchor_dates.append((f"Last {swing_type.title()}", swing_date))
+
+    with Progress(SpinnerColumn(), TextColumn("[bold blue]Computing volume profile...")) as progress:
+        task = progress.add_task("compute", total=None)
+        vp = build_volume_profile(df, ticker, num_bins=bins, anchor_dates=anchor_dates)
+
+    if vp is None:
+        console.print("[red]Could not compute volume profile — insufficient data[/red]")
+        return
+
+    display_volume_profile(vp)
+
+    # Also show S/R levels for comparison
+    sr_levels = find_support_resistance(df, window=5, num_levels=5)
+    if sr_levels:
+        console.print()
+        display_support_resistance(sr_levels, current_price=vp.current_price)
+
+    # Price chart with S/R overlay
+    console.print()
+    chart = ascii_price_chart(
+        df.tail(60),
+        title=f"{ticker} Price ({df.index[-60].strftime('%Y-%m-%d') if len(df) >= 60 else df.index[0].strftime('%Y-%m-%d')} → {end})",
+        support_resistance=sr_levels,
+    )
+    console.print(chart)
+    console.print()
 
 
 # ── SCAN command ───────────────────────────────────────────────────────────────

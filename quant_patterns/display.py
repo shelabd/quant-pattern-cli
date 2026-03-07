@@ -19,7 +19,7 @@ from rich.columns import Columns
 from rich.rule import Rule
 from rich import box
 
-from .analysis import Level, SimilarityResult, PatternProfile, VolumePriceProfile
+from .analysis import Level, SimilarityResult, PatternProfile, VolumePriceProfile, VolumeProfile
 from .events import MarketEvent, EventCategory, EVENT_CATEGORY_LABELS
 from .regime import RegimeResult
 
@@ -682,6 +682,200 @@ def display_volume_price_profile(profile: VolumePriceProfile, show_daily: bool =
             )
 
         console.print(table)
+
+
+def display_volume_profile(vp: VolumeProfile):
+    """Display volume profile with ASCII histogram, key levels, AVWAPs, and signal."""
+    # ── Summary Panel ──
+    pos_labels = {
+        "above_vah": ("ABOVE Value Area", "bright_green"),
+        "in_value_area": ("INSIDE Value Area", "yellow"),
+        "below_val": ("BELOW Value Area", "red"),
+    }
+    pos_label, pos_color = pos_labels.get(vp.position, ("Unknown", "white"))
+
+    summary = Text()
+    summary.append("  Current Price: ", style="bold white")
+    summary.append(f"${vp.current_price:.2f}", style="bold bright_white")
+    summary.append("  |  Position: ", style="dim")
+    summary.append(pos_label, style=f"bold {pos_color}")
+    summary.append("\n  POC: ", style="bold white")
+    summary.append(f"${vp.poc_price:.2f}", style="bold cyan")
+    poc_dir = "above" if vp.poc_distance_pct > 0 else "below"
+    poc_color = "green" if vp.poc_distance_pct > 0 else "red"
+    summary.append(f" ({abs(vp.poc_distance_pct):.2f}% {poc_dir})", style=poc_color)
+    summary.append("  |  VAH: ", style="dim")
+    summary.append(f"${vp.vah_price:.2f}", style="bright_red")
+    summary.append("  |  VAL: ", style="dim")
+    summary.append(f"${vp.val_price:.2f}", style="bright_green")
+    summary.append("\n  Period: ", style="bold white")
+    summary.append(f"{vp.start_date} → {vp.end_date}", style="white")
+    summary.append(f"  |  Bins: {vp.num_bins}", style="dim")
+
+    console.print(Panel(
+        summary,
+        title=f"[bold]Volume Profile — {vp.ticker}[/bold]",
+        border_style="cyan",
+        padding=(0, 1),
+    ))
+
+    # ── ASCII Volume Profile Histogram ──
+    # Show condensed bins (group into ~30 display rows)
+    display_rows = 30
+    bins = vp.bins
+    num_bins = len(bins)
+    group_size = max(1, num_bins // display_rows)
+
+    grouped = []
+    for i in range(0, num_bins, group_size):
+        chunk = bins[i:i + group_size]
+        total_vol = sum(b.volume for b in chunk)
+        total_pct = sum(b.pct_of_total for b in chunk)
+        grouped.append({
+            "price_low": chunk[0].price_low,
+            "price_high": chunk[-1].price_high,
+            "price_mid": (chunk[0].price_low + chunk[-1].price_high) / 2,
+            "volume": total_vol,
+            "pct": total_pct,
+        })
+
+    max_pct = max(g["pct"] for g in grouped) if grouped else 1
+    bar_width = 50
+
+    lines = []
+    lines.append("  Volume Profile (horizontal histogram)")
+    lines.append(f"  {'─' * (bar_width + 22)}")
+
+    for g in reversed(grouped):  # top price = first row
+        bar_len = int(g["pct"] / max_pct * bar_width) if max_pct > 0 else 0
+        price_mid = g["price_mid"]
+
+        # Mark special levels
+        marker = " "
+        style_note = ""
+
+        is_poc = abs(price_mid - vp.poc_price) <= (g["price_high"] - g["price_low"])
+        is_vah = abs(price_mid - vp.vah_price) <= (g["price_high"] - g["price_low"])
+        is_val = abs(price_mid - vp.val_price) <= (g["price_high"] - g["price_low"])
+        is_current = g["price_low"] <= vp.current_price <= g["price_high"]
+
+        if is_poc:
+            style_note = " ◄ POC"
+        elif is_vah:
+            style_note = " ◄ VAH"
+        elif is_val:
+            style_note = " ◄ VAL"
+
+        if is_current:
+            marker = "►"
+            style_note += " ◄ PRICE"
+
+        # Color: value area bins in yellow, outside in dim
+        in_va = g["price_low"] >= vp.val_price and g["price_high"] <= vp.vah_price
+        if is_poc:
+            bar_str = "█" * bar_len + "░" * (bar_width - bar_len)
+        elif in_va:
+            bar_str = "▓" * bar_len + "░" * (bar_width - bar_len)
+        else:
+            bar_str = "▒" * bar_len + "░" * (bar_width - bar_len)
+
+        lines.append(f"  {marker}{price_mid:>8.2f} │{bar_str}{style_note}")
+
+    lines.append(f"  {'':>9}└{'─' * bar_width}")
+    lines.append(f"  {'':>10}Volume ──────────────────────────────────────────►")
+    lines.append(f"  {'':>10}█ POC  ▓ Value Area (70%)  ▒ Low Volume  ► Current Price")
+
+    console.print(Panel("\n".join(lines), border_style="blue"))
+
+    # ── Key Levels Table ──
+    table = Table(
+        title="Key Volume Levels",
+        box=box.ROUNDED,
+        header_style="bold magenta",
+    )
+    table.add_column("Level", width=22)
+    table.add_column("Price", justify="right", width=12)
+    table.add_column("Distance", justify="right", width=12)
+    table.add_column("Significance", width=40)
+
+    # POC
+    table.add_row(
+        Text("Point of Control (POC)", style="bold cyan"),
+        Text(f"${vp.poc_price:.2f}", style="bold cyan"),
+        Text(f"{vp.poc_distance_pct:+.2f}%", style=poc_color),
+        "Highest volume node — strongest mean-reversion magnet",
+    )
+    # VAH
+    vah_dist = ((vp.current_price - vp.vah_price) / vp.vah_price) * 100
+    vah_color = "green" if vah_dist > 0 else "red"
+    table.add_row(
+        Text("Value Area High (VAH)", style="bright_red"),
+        Text(f"${vp.vah_price:.2f}", style="bright_red"),
+        Text(f"{vah_dist:+.2f}%", style=vah_color),
+        "Upper boundary of 70% volume zone — resistance",
+    )
+    # VAL
+    val_dist = ((vp.current_price - vp.val_price) / vp.val_price) * 100
+    val_color = "green" if val_dist > 0 else "red"
+    table.add_row(
+        Text("Value Area Low (VAL)", style="bright_green"),
+        Text(f"${vp.val_price:.2f}", style="bright_green"),
+        Text(f"{val_dist:+.2f}%", style=val_color),
+        "Lower boundary of 70% volume zone — support",
+    )
+
+    console.print(table)
+
+    # ── Anchored VWAPs ──
+    if vp.anchored_vwaps:
+        vwap_table = Table(
+            title="Anchored VWAPs",
+            box=box.ROUNDED,
+            header_style="bold blue",
+        )
+        vwap_table.add_column("Anchor", width=28)
+        vwap_table.add_column("Date", width=12)
+        vwap_table.add_column("VWAP Price", justify="right", width=12)
+        vwap_table.add_column("Distance", justify="right", width=12)
+        vwap_table.add_column("Position", width=20)
+
+        for av in vp.anchored_vwaps:
+            dist_color = "green" if av.distance_pct > 0 else "red"
+            pos = "Price ABOVE" if av.distance_pct > 0 else "Price BELOW"
+            pos_style = "bold green" if av.distance_pct > 0 else "bold red"
+
+            vwap_table.add_row(
+                av.anchor_label,
+                av.anchor_date.isoformat(),
+                Text(f"${av.vwap_price:.2f}", style="bold white"),
+                Text(f"{av.distance_pct:+.2f}%", style=dist_color),
+                Text(pos, style=pos_style),
+            )
+
+        console.print(vwap_table)
+
+    # ── Signal Panel ──
+    signal_text = Text()
+    signal_parts = vp.signal.split(" | ")
+    for i, part in enumerate(signal_parts):
+        if i > 0:
+            signal_text.append("\n")
+        # Color-code based on content
+        if "ABOVE" in part or "bullish" in part.lower():
+            signal_text.append(f"  {part}", style="bright_green")
+        elif "BELOW" in part or "bearish" in part.lower():
+            signal_text.append(f"  {part}", style="red")
+        elif "AT the POC" in part:
+            signal_text.append(f"  {part}", style="bold cyan")
+        else:
+            signal_text.append(f"  {part}", style="yellow")
+
+    console.print(Panel(
+        signal_text,
+        title="[bold]Volume Profile Signal[/bold]",
+        border_style="cyan",
+        padding=(0, 1),
+    ))
 
 
 def display_potus_schedule(items: list[dict]):
