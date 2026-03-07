@@ -1063,6 +1063,78 @@ def display_regime_chart(result: RegimeResult):
     console.print(Panel("\n".join(lines), border_style="blue"))
 
 
+def display_dashboard_signal(signal: dict, ticker: str):
+    """Display combined dashboard signal panel with event/scan/vprofile sub-panels + overall banner."""
+    # Build sub-panels
+    sub_panels = []
+
+    for key, label in [("event", "Event Analysis"), ("scan", "Pattern Scan"), ("vprofile", "Volume Profile")]:
+        section = signal.get(key)
+        if section is None:
+            sub_panels.append(Panel(
+                Text("  N/A", style="dim"),
+                title=f"[bold]{label}[/bold]",
+                border_style="dim",
+                width=28,
+            ))
+            continue
+
+        direction = section.get("direction", "neutral")
+        confidence = section.get("confidence", 0)
+        edge = section.get("edge", 0)
+
+        dir_color = "green" if direction == "bullish" else "red" if direction == "bearish" else "yellow"
+        conf_color = _score_color(confidence)
+
+        body = Text()
+        body.append("  Direction: ", style="bold white")
+        body.append(direction.upper(), style=f"bold {dir_color}")
+        body.append("\n  Confidence: ", style="bold white")
+        body.append(f"{confidence:.0%}", style=f"bold {conf_color}")
+        if edge:
+            body.append("\n  Edge: ", style="bold white")
+            edge_color = "green" if edge > 0 else "red"
+            body.append(f"{edge:+.3f}%", style=edge_color)
+
+        sub_panels.append(Panel(
+            body,
+            title=f"[bold]{label}[/bold]",
+            border_style=dir_color,
+            width=28,
+        ))
+
+    console.print(Columns(sub_panels, equal=True, padding=(0, 1)))
+
+    # Overall signal banner
+    overall_dir = signal.get("overall_direction", "neutral")
+    overall_conf = signal.get("overall_confidence", 0)
+    overall_color = "green" if overall_dir == "bullish" else "red" if overall_dir == "bearish" else "yellow"
+    conf_color = _score_color(overall_conf)
+
+    # Build confidence bar
+    bar_len = int(overall_conf * 20)
+    bar = "█" * bar_len + "░" * (20 - bar_len)
+
+    banner = Text()
+    banner.append("  Overall Signal: ", style="bold white")
+    banner.append(overall_dir.upper(), style=f"bold {overall_color}")
+    banner.append("   Confidence: ", style="bold white")
+    banner.append(f"{bar} {overall_conf:.0%}", style=f"bold {conf_color}")
+    banner.append("\n  Sources: ", style="dim")
+    sources = []
+    for key in ["event", "scan", "vprofile"]:
+        if signal.get(key) is not None:
+            sources.append(key)
+    banner.append(", ".join(sources) if sources else "none", style="dim")
+
+    console.print(Panel(
+        banner,
+        title=f"[bold]Combined Signal — {ticker}[/bold]",
+        border_style=overall_color,
+        padding=(0, 1),
+    ))
+
+
 def display_regime_conditional_winrates(ticker: str, category: str, regime_winrates: dict):
     """Table of win rate / avg return / sample size per regime.
 

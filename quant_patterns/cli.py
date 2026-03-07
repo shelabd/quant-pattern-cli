@@ -47,6 +47,7 @@ from .display import (
     display_agent_export,
     display_categories,
     display_comparison_chart,
+    display_dashboard_signal,
     display_event_list,
     display_pattern_profile,
     display_potus_schedule,
@@ -385,6 +386,271 @@ def _compute_regime_winrates(
             }
     if regime_winrates:
         display_regime_conditional_winrates(ticker, event_type, regime_winrates)
+
+
+# ── Dashboard helpers ──────────────────────────────────────────────────────────
+
+
+# Heuristic ticker→category mappings for broad-market / sector ETFs
+_TICKER_CATEGORY_HEURISTICS: dict[str, EventCategory] = {
+    "SPY": EventCategory.FOMC, "QQQ": EventCategory.FOMC, "IWM": EventCategory.FOMC,
+    "DIA": EventCategory.FOMC, "VOO": EventCategory.FOMC, "VTI": EventCategory.FOMC,
+    "XLE": EventCategory.OPEC, "USO": EventCategory.OPEC, "OIL": EventCategory.OPEC,
+    "BTC-USD": EventCategory.CRYPTO, "ETH-USD": EventCategory.CRYPTO,
+    "COIN": EventCategory.CRYPTO, "MSTR": EventCategory.CRYPTO,
+}
+
+
+def _auto_detect_event_category(
+    ticker: str,
+    catalog: EventCatalog,
+) -> Optional[EventCategory]:
+    """Pick the best event category for *ticker* automatically.
+
+    Priority:
+    1. Ticker-specific events (e.g. NVDA → EARNINGS)
+    2. Hard-coded heuristics (SPY → FOMC, XLE → OPEC, BTC-USD → CRYPTO)
+    3. Most-common category in catalog that matches the ticker
+    4. None (skip event analysis)
+    """
+    # 1. Ticker-specific events
+    ticker_events = [e for e in catalog.events if e.ticker_specific == ticker]
+    if ticker_events:
+        from collections import Counter
+        most_common = Counter(e.category for e in ticker_events).most_common(1)
+        return most_common[0][0]
+
+    # 2. Heuristic map
+    if ticker in _TICKER_CATEGORY_HEURISTICS:
+        return _TICKER_CATEGORY_HEURISTICS[ticker]
+
+    # 3. Most-common broad-market category
+    broad = catalog.search(ticker=ticker)
+    if broad:
+        from collections import Counter
+        most_common = Counter(e.category for e in broad).most_common(1)
+        return most_common[0][0]
+
+    return None
+
+
+def _build_anchor_dates(
+    df,
+    catalog: EventCatalog,
+    ticker: str,
+    event_type: Optional[EventCategory],
+    end: date,
+) -> list[tuple[str, date]]:
+    """Build AVWAP anchor dates: YTD open, last event, last swing point."""
+    anchor_dates: list[tuple[str, date]] = []
+    data_start = df.index[0].date() if hasattr(df.index[0], "date") else df.index[0]
+
+    # 1. YTD open
+    ytd_start = date(end.year, 1, 1)
+    if data_start <= ytd_start:
+        anchor_dates.append(("YTD Open", ytd_start))
+    else:
+        anchor_dates.append(("Period Start", data_start))
+
+    # 2. Last event
+    if event_type:
+        events = catalog.search(category=event_type, ticker=ticker, end=end)
+        past = [e for e in events if data_start <= e.date <= end]
+        if past:
+            last_evt = past[-1]
+            anchor_dates.append((f"Last {event_type.value.upper()}: {last_evt.name}", last_evt.date))
+    else:
+        for cat in [EventCategory.EARNINGS, EventCategory.FOMC]:
+            events = catalog.search(category=cat, ticker=ticker, end=end)
+            past = [e for e in events if data_start <= e.date <= end]
+            if past:
+                last_evt = past[-1]
+                anchor_dates.append((f"Last {cat.value.upper()}: {last_evt.name}", last_evt.date))
+                break
+
+    # 3. Last swing point
+    swing = _find_swing_point(df, window=10)
+    if swing:
+        swing_date, swing_type = swing
+        anchor_dates.append((f"Last {swing_type.title()}", swing_date))
+
+    return anchor_dates
+
+
+def _compute_scan_forward_avg(
+    df,
+    results: list,
+    window_size: int,
+) -> dict:
+    """Return avg forward returns {5: pct, 10: pct, 20: pct} and per-horizon direction counts."""
+    import pandas as pd
+
+    fwd_avgs: dict[int, float] = {}
+    fwd_dirs: dict[int, list[float]] = {5: [], 10: [], 20: []}
+
+    for r in results:
+        if r.event_date is None:
+            continue
+        match_start_idx = df.index.searchsorted(pd.Timestamp(r.event_date))
+        match_end_idx = match_start_idx + window_size
+
+        for horizon in [5, 10, 20]:
+            fwd_idx = match_end_idx + horizon - 1
+            if match_end_idx < len(df) and fwd_idx < len(df):
+                end_price = df["Close"].iloc[match_end_idx - 1]
+                fwd_price = df["Close"].iloc[fwd_idx]
+                ret = (fwd_price / end_price - 1) * 100
+                fwd_dirs[horizon].append(ret)
+
+    for h in [5, 10, 20]:
+        if fwd_dirs[h]:
+            fwd_avgs[h] = float(np.mean(fwd_dirs[h]))
+
+    return fwd_avgs
+
+
+def _build_dashboard_signal(
+    event_profile,
+    scan_results: list,
+    scan_fwd: dict,
+    vp,
+    regime_result=None,
+) -> dict:
+    """Synthesize overall signal from event, scan, and vprofile analyses.
+
+    Returns dict with keys: event, scan, vprofile, overall_direction, overall_confidence.
+    """
+    signal: dict = {"event": None, "scan": None, "vprofile": None}
+    votes: list[tuple[str, float]] = []  # (direction, weight)
+
+    # Event signal
+    if event_profile is not None:
+        direction = "bullish" if event_profile.avg_return_after > 0 else "bearish"
+        confidence = min(1.0, event_profile.positive_after_pct / 100 if direction == "bullish"
+                         else (100 - event_profile.positive_after_pct) / 100)
+        signal["event"] = {
+            "direction": direction,
+            "confidence": confidence,
+            "edge": round(event_profile.avg_return_after, 3),
+        }
+        votes.append((direction, confidence * 0.40))
+
+    # Scan signal
+    if scan_fwd:
+        # Use +10d as primary horizon
+        horizon_ret = scan_fwd.get(10, scan_fwd.get(5, 0))
+        direction = "bullish" if horizon_ret > 0 else "bearish"
+        # Confidence: how many matches agree
+        if scan_results:
+            avg_score = float(np.mean([r.composite_score for r in scan_results]))
+        else:
+            avg_score = 0.5
+        confidence = min(1.0, avg_score)
+        signal["scan"] = {
+            "direction": direction,
+            "confidence": confidence,
+            "edge": round(horizon_ret, 3),
+        }
+        votes.append((direction, confidence * 0.35))
+
+    # Volume profile signal
+    if vp is not None:
+        # Determine direction from position + AVWAP
+        if vp.position == "above_vah":
+            direction = "bullish"
+        elif vp.position == "below_val":
+            direction = "bearish"
+        else:
+            # Inside value area — use POC distance as tiebreaker
+            direction = "bullish" if vp.poc_distance_pct > 0 else "bearish"
+
+        # AVWAP consensus
+        if vp.anchored_vwaps:
+            above = sum(1 for v in vp.anchored_vwaps if v.distance_pct > 0)
+            avwap_ratio = above / len(vp.anchored_vwaps)
+        else:
+            avwap_ratio = 0.5
+        confidence = avwap_ratio if direction == "bullish" else (1 - avwap_ratio)
+        confidence = max(0.3, min(1.0, confidence))
+
+        signal["vprofile"] = {
+            "direction": direction,
+            "confidence": confidence,
+            "edge": round(vp.poc_distance_pct, 3),
+        }
+        votes.append((direction, confidence * 0.25))
+
+    # Weighted majority vote
+    if votes:
+        bull_weight = sum(w for d, w in votes if d == "bullish")
+        bear_weight = sum(w for d, w in votes if d == "bearish")
+        total = bull_weight + bear_weight
+        if total > 0:
+            signal["overall_direction"] = "bullish" if bull_weight >= bear_weight else "bearish"
+            signal["overall_confidence"] = max(bull_weight, bear_weight) / total
+        else:
+            signal["overall_direction"] = "neutral"
+            signal["overall_confidence"] = 0
+    else:
+        signal["overall_direction"] = "neutral"
+        signal["overall_confidence"] = 0
+
+    return signal
+
+
+def _build_dashboard_export(
+    ticker: str,
+    signal: dict,
+    event_profile,
+    scan_results: list,
+    scan_fwd: dict,
+    vp,
+    sr_levels: list,
+    vp_profile,
+    regime_result=None,
+) -> dict:
+    """Combine all dashboard results into a single JSON-exportable dict."""
+    export: dict = {
+        "ticker": ticker,
+        "generated": date.today().isoformat(),
+        "signal": signal,
+    }
+
+    if event_profile is not None:
+        export["event_analysis"] = event_profile.to_dict()
+
+    if scan_results:
+        export["scan_matches"] = [
+            {
+                "period": r.event_name,
+                "start_date": r.event_date.isoformat() if r.event_date else None,
+                "composite_score": round(r.composite_score, 4),
+                "correlation": round(r.correlation, 4),
+                "direction_match": round(r.direction_match, 4),
+                "label": r.score_label,
+            }
+            for r in scan_results
+        ]
+
+    if scan_fwd:
+        export["scan_forward_returns"] = {f"+{k}d": round(v, 3) for k, v in scan_fwd.items()}
+
+    if vp is not None:
+        export["volume_profile"] = vp.to_dict()
+
+    if sr_levels:
+        export["support_resistance"] = [
+            {"price": lvl.price, "type": lvl.kind, "touches": lvl.touches, "strength": lvl.strength}
+            for lvl in sr_levels
+        ]
+
+    if vp_profile is not None:
+        export["volume_price_authenticity"] = vp_profile.to_dict()
+
+    if regime_result is not None:
+        export["regime"] = regime_result.to_dict()
+
+    return export
 
 
 # ── CLI Group ───────────────────────────────────────────────────────────────────
@@ -1403,6 +1669,224 @@ def regime(ticker, lookback, states, export_json, provider, verbose):
         path = Path(export_json)
         path.write_text(json.dumps(result.to_dict(), indent=2, default=str))
         console.print(f"\n[green]✓ Exported regime data to {path}[/green]")
+
+
+# ── DASHBOARD command ──────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("ticker")
+@click.option("--event-type", "-e", type=click.Choice([c.value for c in EventCategory]),
+              default=None, help="Event category (auto-detected if omitted)")
+@click.option("--days", "-d", default=15, help="Window size in trading days")
+@click.option("--lookback", "-l", default=1000, help="Calendar days of history to scan")
+@click.option("--top-n", "-n", default=5, help="Number of top matches to show per section")
+@click.option("--bins", "-b", default=100, help="Volume profile price bins")
+@click.option("--regime", "-r", is_flag=True, default=False, help="Include regime detection")
+@click.option("--target-date", "-t", default=None, help="Target date (YYYY-MM-DD). Default: today")
+@click.option("--export-json", "-o", default=None, help="Export combined results to JSON")
+@common_options
+def dashboard(ticker, event_type, days, lookback, top_n, bins, regime, target_date,
+              export_json, provider, verbose):
+    """
+    Unified research dashboard combining event analysis, pattern scan, and volume profile.
+
+    Runs all three analyses with shared data fetching and presents results in
+    labeled sections ending with a combined signal summary.
+
+    Examples:
+
+      qpat dashboard SPY
+
+      qpat dashboard NVDA -e earnings --regime
+
+      qpat dashboard QQQ -d 20 -o dash.json
+    """
+    setup_logging(verbose)
+    ticker = ticker.upper()
+    dp = get_data_provider(provider)
+    catalog = EventCatalog()
+
+    end = datetime.strptime(target_date, "%Y-%m-%d").date() if target_date else date.today()
+    start = end - timedelta(days=lookback)
+
+    # Auto-detect event category
+    category = EventCategory(event_type) if event_type else _auto_detect_event_category(ticker, catalog)
+    cat_label = category.value.upper() if category else "NONE"
+
+    console.print(f"\n[bold cyan]⚡ Dashboard: {ticker}[/bold cyan]")
+    console.print(f"   Events: {cat_label} | Window: {days}d | Lookback: {lookback}d | Bins: {bins}")
+    console.print(f"   Provider: {dp.name()}\n")
+
+    display_ticker_info(fetch_ticker_info(ticker))
+    console.print()
+
+    # ── Single data fetch ──────────────────────────────────────────────────
+    with Progress(SpinnerColumn(), TextColumn("[bold blue]Fetching historical data...")) as progress:
+        progress.add_task("fetch", total=None)
+        try:
+            df = dp.get_daily_ohlcv(ticker, start, end)
+        except Exception as e:
+            console.print(f"[red]Error: {e}[/red]")
+            return
+
+    current_price = float(df["Close"].iloc[-1])
+    console.print(f"  Loaded {len(df)} trading days ({df.index[0].date()} → {df.index[-1].date()})")
+    console.print(f"  Current close: ${current_price:.2f}\n")
+
+    # ── Regime detection (optional) ────────────────────────────────────────
+    regime_result = None
+    if regime:
+        from .regime import run_regime_detection
+        console.print("[bold]Detecting market regime...[/bold]")
+        try:
+            regime_result = run_regime_detection(dp, ticker, lookback_days=lookback)
+            display_regime_summary(regime_result)
+            console.print()
+        except Exception as e:
+            console.print(f"  [yellow]Regime detection failed ({e}), continuing without[/yellow]\n")
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Section 1: Market Context — S/R, Price Chart, Volume Profile, Vol-Price
+    # ══════════════════════════════════════════════════════════════════════
+    from rich.rule import Rule
+    console.print(Rule("[bold magenta]Market Context"))
+
+    # S/R levels
+    sr_levels = find_support_resistance(df.tail(180))
+    if sr_levels:
+        display_support_resistance(sr_levels, current_price=current_price)
+
+    # Price chart with S/R overlay
+    chart_df = df.tail(60)
+    chart = ascii_price_chart(
+        chart_df,
+        title=f"{ticker} (Last 60 Trading Days)",
+        support_resistance=sr_levels,
+    )
+    console.print(f"\n{chart}\n")
+
+    # Volume Profile + AVWAP
+    anchor_dates = _build_anchor_dates(df, catalog, ticker, category, end)
+    vp_df = df.tail(max(60, days * 3))
+    vp = build_volume_profile(vp_df, ticker, num_bins=bins, anchor_dates=anchor_dates)
+    if vp:
+        display_volume_profile(vp)
+
+    # Volume-Price Authenticity
+    console.print()
+    vp_profile = analyze_volume_price(df, report_last_n=days)
+    if vp_profile:
+        vp_profile.ticker = ticker
+        display_volume_price_profile(vp_profile, show_daily=False)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Section 2: Event Analysis (if category found)
+    # ══════════════════════════════════════════════════════════════════════
+    event_profile = None
+    event_similarity_results = []
+
+    if category:
+        events = catalog.search(category=category, ticker=ticker)
+        if events:
+            console.print()
+            console.print(Rule(f"[bold magenta]Event Analysis — {cat_label}"))
+
+            # Target window for event comparison
+            t_date = end
+            result = _fetch_target_window(dp, ticker, t_date, days, days)
+            if result is not None:
+                target_window, target_norm = result
+
+                # Exclude self-comparisons
+                tw_start = target_window.index[0].date()
+                tw_end = target_window.index[-1].date()
+                compare_events = [e for e in events if not (tw_start <= e.date <= tw_end)]
+
+                if compare_events:
+                    windows, event_similarity_results = _compare_events(
+                        dp, ticker, target_norm, compare_events, days, days,
+                    )
+
+                    if event_similarity_results:
+                        display_similarity_results(event_similarity_results, top_n=top_n)
+
+                        top_matches = sorted(event_similarity_results,
+                                             key=lambda s: s.composite_score, reverse=True)
+                        display_comparison_chart(target_norm, top_matches, max_overlays=3)
+
+                        event_profile = build_pattern_profile(
+                            ticker, category.value, windows, event_similarity_results,
+                        )
+                        display_pattern_profile(event_profile)
+
+                        # Event forecast
+                        console.print()
+                        _run_event_forecast(event_similarity_results, target_window,
+                                            ticker, catalog, category, dp)
+        else:
+            console.print(f"\n  [dim]No {cat_label} events found for {ticker} — skipping event analysis[/dim]")
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Section 3: Pattern Scan (event-free sliding window)
+    # ══════════════════════════════════════════════════════════════════════
+    console.print()
+    console.print(Rule("[bold magenta]Pattern Scan"))
+
+    scan_results = []
+    scan_fwd: dict = {}
+
+    if len(df) >= days * 2:
+        with Progress(SpinnerColumn(), TextColumn("[bold blue]Scanning patterns...")) as progress:
+            progress.add_task("scan", total=None)
+            scan_results = sliding_window_scan(df, window_size=days, step=1, top_n=top_n)
+
+        if scan_results:
+            display_similarity_results(scan_results, top_n=top_n)
+
+            # Overlay chart
+            target_df = df.iloc[-days:].copy()
+            target_df["rel_day"] = range(days)
+            target_ref = target_df["Close"].iloc[0]
+            target_df["Close_norm"] = ((target_df["Close"] / target_ref) - 1) * 100
+            display_comparison_chart(target_df, scan_results, target_label="Current", max_overlays=3)
+
+            # Forward returns table
+            console.print()
+            _display_scan_forward_returns(df, scan_results, days)
+
+            # Forward averages for signal synthesis
+            scan_fwd = _compute_scan_forward_avg(df, scan_results, days)
+
+            # Scan forecast
+            console.print()
+            _display_forecast(df, scan_results, days, ticker)
+        else:
+            console.print("  [dim]No similar patterns found in scan[/dim]")
+    else:
+        console.print(f"  [dim]Insufficient data for {days}-day scan[/dim]")
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Section 4: Signal Summary
+    # ══════════════════════════════════════════════════════════════════════
+    console.print()
+    console.print(Rule("[bold magenta]Signal Summary"))
+
+    signal = _build_dashboard_signal(event_profile, scan_results, scan_fwd, vp, regime_result)
+    display_dashboard_signal(signal, ticker)
+
+    # ── Export ─────────────────────────────────────────────────────────────
+    if export_json:
+        export_data = _build_dashboard_export(
+            ticker, signal, event_profile, scan_results, scan_fwd,
+            vp, sr_levels, vp_profile, regime_result,
+        )
+        path = Path(export_json)
+        path.write_text(json.dumps(export_data, indent=2, default=str))
+        console.print(f"\n[green]✓ Exported dashboard to {path}[/green]")
+    else:
+        console.print(
+            "\n[dim]Tip: Use --export-json dash.json to export combined results[/dim]"
+        )
 
 
 # ── POTUS command ──────────────────────────────────────────────────────────────
