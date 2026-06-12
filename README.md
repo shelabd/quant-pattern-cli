@@ -100,8 +100,26 @@ nothing fits, the verdict is NO TRADE. The ticket includes a suggested limit
 price; **fills above the ceiling void the trade**. CPI/PPI/FOMC/NFP prints
 inside the holding window trigger a warning and halve the sizing guidance
 (base: 0.5-1% of account per fly). Output is **analysis, not financial
-advice** — nothing is ever routed to a broker, and yfinance open interest is
-end-of-day stale, so verify the pin on your broker before entry.
+advice** — nothing is ever routed to a broker, and open interest is
+end-of-day everywhere (OCC publishes it overnight), so verify the pin on
+your broker before entry.
+
+**Chain data sources.** By default chains come from **CBOE's free
+delayed-quotes feed** — no key, no subscription: one GET returns the whole
+chain with per-contract open interest, bid/ask, IV, and server-side greeks
+(gamma is used directly in pin scoring instead of the local Black-Scholes
+estimate). Quotes are 15-min delayed; OI is as of last close, like every
+source. Index tickers (SPX, XSP, VIX, RUT) work too. With a
+[Massive](https://massive.com) API key configured (the rebranded
+Polygon.io; options snapshots require a paid plan), `qpat fly`
+automatically upgrades to OPRA-consolidated NBBO snapshots. Any
+chain-source failure degrades to yfinance with a warning rather than
+erroring.
+
+```bash
+qpat fly SPY                                  # CBOE free feed, zero setup
+qpat config set massive-api-key <YOUR_KEY>    # optional paid upgrade
+```
 
 | Flag | Description |
 |------|-------------|
@@ -111,6 +129,7 @@ end-of-day stale, so verify the pin on your broker before entry.
 | `--min-dte` / `--max-dte` | Expiry window in days (default: 2-5) |
 | `--account` | Account size in dollars for sizing output |
 | `--expiry` | Explicit expiry (YYYY-MM-DD), overrides the DTE window |
+| `--chain-source` | `auto` (default), `cboe`, `massive`, or `yfinance` |
 | `--json` | Emit machine-readable JSON instead of the Rich ticket |
 
 ### `qpat sr TICKER`
