@@ -1225,6 +1225,7 @@ def display_fly(rec) -> None:
     if rec.selected_width is not None:
         width_note = "adaptive" if rec.width_was_adaptive else "fixed"
         header.append(f"  width {rec.selected_width:g} ({width_note})", style="white")
+    header.append(f"  [{rec.data_source}]", style="dim")
     console.print(Panel(header, title="[bold]3-Day Pin Fly[/bold]", border_style="cyan"))
 
     # ── NO TRADE short-circuit ──────────────────────────────────────────

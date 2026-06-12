@@ -2063,11 +2063,16 @@ def dashboard(ticker, event_type, days, lookback, top_n, bins, regime, target_da
               help="Account size in dollars (sizing shown in dollars as well as %)")
 @click.option("--expiry", "expiry_str", default=None,
               help="Explicit expiry (YYYY-MM-DD), overrides DTE window")
+@click.option("--chain-source", type=click.Choice(["auto", "cboe", "massive", "yfinance"]),
+              default="auto", show_default=True,
+              help="Options chain source (auto = Massive when an API key is "
+                   "configured via `qpat config set massive-api-key`, else "
+                   "CBOE's free delayed feed; yfinance is the failure fallback)")
 @click.option("--json", "as_json", is_flag=True,
               help="Emit the recommendation as JSON (for piping)")
 @common_options
 def fly(ticker, width, min_rr, band, min_dte, max_dte, account, expiry_str,
-        as_json, provider, verbose):
+        chain_source, as_json, provider, verbose):
     """
     Recommend a 3-Day Pin Fly: a 2-5 DTE butterfly bodied on the highest
     open-interest pin strike near spot, targeting structural risk:reward
@@ -2114,6 +2119,7 @@ def fly(ticker, width, min_rr, band, min_dte, max_dte, account, expiry_str,
             fixed_width=width,
             account=account,
             expiry_override=expiry_override,
+            chain_source=chain_source,
         )
     except Exception as e:
         if as_json:

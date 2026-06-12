@@ -14,11 +14,15 @@ and is unit-testable offline.
 
 Data caveats
 ------------
-yfinance ``openInterest`` is end-of-day stale (updated overnight) and
-``impliedVolatility`` is a rough Black-Scholes inversion of possibly stale
-quotes. Treat pin scores as indicative; verify OI on your broker before
-entry. Output is analysis, not financial advice — this module recommends
-and never places orders.
+Chains come from the options_data provider layer: CBOE's free delayed feed
+by default (reliable OI, 15-min delayed quotes, server-side greeks), or
+Massive (OPRA-fed NBBO) when an API key is configured, degrading to
+yfinance on failure — whose ``openInterest`` is often missing on fresh
+weeklies and whose ``impliedVolatility`` is a rough Black-Scholes
+inversion of possibly stale quotes. Open interest is end-of-day everywhere
+(OCC publishes it overnight): verify OI on your broker before entry.
+Output is analysis, not financial advice — this module recommends and
+never places orders.
 """
 
 from __future__ import annotations
@@ -106,6 +110,7 @@ class FlyRecommendation:
     sizing_pct: tuple[float, float] = BASE_SIZING_PCT
     account_size: Optional[float] = None
     min_rr: float = DEFAULT_MIN_RR
+    data_source: str = "Yahoo Finance"
 
     def to_dict(self) -> dict:
         def per_fly(v: Optional[float]) -> Optional[float]:
@@ -141,6 +146,7 @@ class FlyRecommendation:
             "sizing_pct": {"low": self.sizing_pct[0], "high": self.sizing_pct[1]},
             "account_size": self.account_size,
             "min_rr": self.min_rr,
+            "data_source": self.data_source,
             "disclaimer": "Analysis only — not financial advice. OI as of last close; verify on your broker before entry.",
         }
         return d
@@ -247,11 +253,14 @@ def score_pins(
 ) -> pd.DataFrame:
     """Score every strike inside the drift band.
 
-    Score = total OI (calls + puts) weighted by Black-Scholes gamma, with a
-    +10% bonus for strikes divisible by 5. When the entire band reports zero
-    OI (yfinance leaves freshly listed weeklies at 0 until the overnight
-    update) the score falls back to total volume as the concentration proxy;
-    `attrs["used_volume_fallback"]` is set on the result.
+    Score = total OI (calls + puts) weighted by gamma, with a +10% bonus for
+    strikes divisible by 5. Gamma is the chain's server-computed `gamma`
+    column where present and positive (Massive provides one); strikes
+    without it get a local Black-Scholes estimate. When the entire band
+    reports zero OI (yfinance leaves freshly listed weeklies at 0 until the
+    overnight update) the score falls back to total volume as the
+    concentration proxy; `attrs["used_volume_fallback"]` is set on the
+    result.
 
     Returns the band subset with `total_oi`, `total_vol`, `pin_score`, and
     `oi_rank` (1 = highest raw weight) columns, sorted by pin_score
@@ -272,8 +281,13 @@ def score_pins(
                        and band["total_vol"].sum() > 0)
     weight = band["total_vol"] if used_volume else band["total_oi"]
 
-    band["gamma"] = band.apply(
+    bs = band.apply(
         lambda r: bs_gamma(spot, r["strike"], r["iv"], t_years), axis=1)
+    if "gamma" in band.columns:
+        provider_gamma = pd.to_numeric(band["gamma"], errors="coerce")
+        band["gamma"] = provider_gamma.where(provider_gamma > 0).fillna(bs)
+    else:
+        band["gamma"] = bs
     bonus = np.where(band["strike"] % 5 == 0, ROUND_NUMBER_BONUS, 1.0)
     band["pin_score"] = weight * band["gamma"] * bonus
     band["oi_rank"] = weight.rank(ascending=False, method="min").astype(int)
@@ -530,64 +544,65 @@ def recommend_fly(
     account: Optional[float] = None,
     expiry_override: Optional[date] = None,
     today: Optional[date] = None,
+    chain_source: str = "auto",
 ) -> FlyRecommendation:
-    """End-to-end pin-fly recommendation against live yfinance data.
+    """End-to-end pin-fly recommendation against live data.
 
     The only function in this module that touches the network. OHLCV (for
-    drift and spot) goes through data.py's provider; option chains use
-    yfinance directly.
-    TODO: extend the DataProvider ABC with an options-chain method so IBKR
-    can serve fresher OI than yfinance's end-of-day snapshot.
+    drift and spot) goes through data.py's provider; option chains go
+    through options_data's provider layer — Massive when an API key is
+    configured, else CBOE's free delayed feed. A chain-source failure
+    degrades to yfinance with a warning instead of erroring.
     """
-    import yfinance as yf
     from datetime import timedelta
     from .data import get_provider
     from .events import EventCatalog
+    from .options_data import fetch_chains_with_fallback, get_options_provider
 
     ticker = ticker.upper()
     today = today or date.today()
 
     # ── Spot + drift from provider OHLCV ──────────────────────────────
     provider = get_provider("yfinance")
-    history = provider.get_daily_ohlcv(ticker, today - timedelta(days=90), today)
+    try:
+        history = provider.get_daily_ohlcv(ticker, today - timedelta(days=90), today)
+    except ValueError:
+        # Index tickers (SPX, VIX, RUT) live under a caret on Yahoo.
+        history = provider.get_daily_ohlcv(f"^{ticker}", today - timedelta(days=90), today)
     close = history["Close"]
     spot = float(close.iloc[-1])
     drift = detect_drift(close)
+
+    # ── Candidate expiries + chains via the options provider ─────────
+    if expiry_override is not None:
+        window = (expiry_override, expiry_override)
+    else:
+        window = (today + timedelta(days=min_dte), today + timedelta(days=max_dte))
+
+    oprov, candidates, source_warnings = fetch_chains_with_fallback(
+        get_options_provider(chain_source), ticker, *window)
 
     base = dict(
         ticker=ticker, spot=spot, drift=drift, right="",
         expiry=None, dte=None, body_strike=None,
         selected_width=None, width_was_adaptive=fixed_width is None,
-        account_size=account, min_rr=min_rr,
+        account_size=account, min_rr=min_rr, data_source=oprov.name(),
     )
 
-    # ── Candidate expiries ────────────────────────────────────────────
-    tk = yf.Ticker(ticker)
-    all_expiries = [date.fromisoformat(e) for e in (tk.options or ())]
-    if expiry_override is not None:
-        candidates_dates = [e for e in all_expiries if e == expiry_override]
-        if not candidates_dates:
-            return _no_trade(base, f"expiry {expiry_override} not listed for {ticker}")
-    else:
-        candidates_dates = [e for e in all_expiries
-                            if min_dte <= (e - today).days <= max_dte]
-        if not candidates_dates:
-            return _no_trade(base, f"no listed expiries within {min_dte}-{max_dte} DTE")
-
-    candidates: list[tuple[date, pd.DataFrame]] = []
-    for exp in candidates_dates:
-        try:
-            oc = tk.option_chain(exp.isoformat())
-            candidates.append((exp, normalize_chain(oc.calls, oc.puts)))
-        except Exception as e:
-            logger.warning(f"Could not load chain for {exp}: {e}")
     if not candidates:
-        return _no_trade(base, "no option chains could be loaded")
+        if expiry_override is not None:
+            rec = _no_trade(base, f"expiry {expiry_override} not listed for {ticker}")
+        else:
+            rec = _no_trade(base, f"no listed expiries within {min_dte}-{max_dte} DTE")
+        rec.warnings = source_warnings
+        return rec
 
     # ── OI-aware expiry + pin selection ───────────────────────────────
     choice = choose_expiry(candidates, spot, today, band_pct, drift)
     if choice is None:
-        return _no_trade(base, f"no strikes inside the {band_pct}% {drift} band on any candidate expiry")
+        rec = _no_trade(base, f"no strikes inside the {band_pct}% {drift} band on any candidate expiry")
+        rec.warnings = source_warnings
+        return rec
 
     expiry, dte, chain, pin = choice["expiry"], choice["dte"], choice["chain"], choice["pin"]
     body = pin["strike"]
@@ -602,11 +617,11 @@ def recommend_fly(
     base.update(right=right, expiry=expiry, dte=dte, body_strike=body)
 
     # ── Adaptive width / pricing ──────────────────────────────────────
-    oi_warnings: list[str] = []
+    oi_warnings: list[str] = list(source_warnings)
     if pin["used_volume"]:
         oi_warnings.append(
-            "Chain reports zero open interest across the band (yfinance OI "
-            "updates overnight) — pin scored by today's volume instead. "
+            "Chain reports zero open interest across the band (OI updates "
+            "overnight) — pin scored by today's volume instead. "
             "Verify the OI wall on your broker before trusting this pin."
         )
 
