@@ -36,6 +36,10 @@ qpat fly SPY
 qpat fly SPY --min-rr 15 --account 25000
 qpat fly SPY --json | jq .legs
 
+# Walk-forward backtest: do the signals actually predict, out of sample?
+qpat backtest SPY
+qpat backtest SPY -e fomc --horizon 5 -o bt.json
+
 # Interactive guided mode
 qpat interactive
 
@@ -111,6 +115,30 @@ end-of-day stale, so verify the pin on your broker before entry.
 
 ### `qpat sr TICKER`
 Support & resistance detection using local extrema clustering. Shows touch count and strength.
+
+### `qpat backtest TICKER`
+**Walk-forward backtest** of qpat's directional signals — the command that
+answers "how much should I trust this tool?". At each historical as-of date
+the signal is rebuilt from only the data available then (prior events for the
+event signal; trailing history for the pattern scan) and its direction is
+scored against the realized next-N-day return. The hit rate is tested against
+the **majority-class baseline**: in a market that rose 61% of windows,
+"always bullish" already hits 61%, so the signal must beat that, not 50%. A
+calibration table shows whether higher signal confidence actually translates
+into a higher hit rate. Overlapping scoring windows are flagged because they
+make p-values optimistic. Believe this command's p-values over any single
+signal's confidence — and expect "NOT distinguishable from baseline" to be
+the common verdict; that is the honest state of the evidence, not a bug.
+
+| Flag | Description |
+|------|-------------|
+| `-e` | Event category for the event leg (default: `all` = cpi+ppi+fomc+nfp) |
+| `--horizon` | Trading days each signal is scored over (default: 10) |
+| `--mode` | `both`, `events`, or `scan` (default: both) |
+| `--step` | Days between scan as-of dates (default: horizon → no overlap) |
+| `--lookback` | Calendar days of scan history (default: 2000) |
+| `--min-history` | Prior events required before scoring (default: 5) |
+| `-o` | Export full results (per-signal outcomes included) to JSON |
 
 ### `qpat events list|categories|add`
 Browse, search, and extend the event catalog.
