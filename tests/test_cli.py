@@ -33,6 +33,29 @@ def _mock_ohlcv(start_date="2024-01-02", periods=30, base=100.0):
     )
 
 
+def _mock_ohlcv_range(ticker, start, end, base=100.0):
+    """Range-respecting mock for get_daily_ohlcv side_effect: returns data
+    spanning the requested dates, like a real provider would. A fixed-range
+    mock silently re-anchors event windows, which fetch_event_window now
+    rejects."""
+    dates = pd.bdate_range(start, end)
+    if len(dates) == 0:
+        raise ValueError(f"No data for {ticker} between {start} and {end}")
+    n = len(dates)
+    np.random.seed(42)
+    close = base + np.cumsum(np.random.normal(0, 1, n))
+    return pd.DataFrame(
+        {
+            "Open": close - 0.5,
+            "High": close + 1.0,
+            "Low": close - 1.0,
+            "Close": close,
+            "Volume": np.random.randint(1_000_000, 5_000_000, n),
+        },
+        index=dates,
+    )
+
+
 # ── Version & Help ────────────────────────────────────────────────────────────
 
 
@@ -188,7 +211,7 @@ class TestExportCommand:
     def test_export_runs(self, mock_get_dp, runner, tmp_path):
         mock_dp = MagicMock()
         mock_dp.name.return_value = "Mock"
-        mock_dp.get_daily_ohlcv.return_value = _mock_ohlcv()
+        mock_dp.get_daily_ohlcv.side_effect = _mock_ohlcv_range
         mock_get_dp.return_value = mock_dp
 
         outfile = str(tmp_path / "test_export.json")
@@ -201,7 +224,7 @@ class TestExportCommand:
     def test_export_with_event_ticker(self, mock_get_dp, runner, tmp_path):
         mock_dp = MagicMock()
         mock_dp.name.return_value = "Mock"
-        mock_dp.get_daily_ohlcv.return_value = _mock_ohlcv()
+        mock_dp.get_daily_ohlcv.side_effect = _mock_ohlcv_range
         mock_get_dp.return_value = mock_dp
 
         outfile = str(tmp_path / "test_export.json")

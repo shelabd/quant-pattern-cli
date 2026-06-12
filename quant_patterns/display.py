@@ -315,8 +315,12 @@ def display_similarity_results(results: list[SimilarityResult], top_n: int = 10)
     console.print(table)
 
 
-def display_pattern_profile(profile: PatternProfile):
-    """Display the aggregated pattern profile."""
+def display_pattern_profile(profile: PatternProfile, signal_stats=None):
+    """Display the aggregated pattern profile.
+
+    signal_stats: optional precomputed SignalStats (with baseline); computed
+    from the profile without a baseline when omitted.
+    """
     console.print(Rule(f"[bold cyan]Pattern Profile: {profile.ticker} × {profile.category.upper()}"))
     console.print()
 
@@ -345,20 +349,40 @@ def display_pattern_profile(profile: PatternProfile):
 
     console.print(stats_table)
 
-    # Signal
-    direction = "BULLISH" if profile.avg_return_after > 0 else "BEARISH"
-    dir_color = "green" if profile.avg_return_after > 0 else "red"
-    confidence = min(1.0, profile.positive_after_pct / 100 if profile.avg_return_after > 0
-                     else (100 - profile.positive_after_pct) / 100)
+    # Signal — statistically grounded (Wilson-shrunk confidence, binomial p-value)
+    from .analysis import compute_signal_stats
+
+    stats = signal_stats or compute_signal_stats(profile)
+    dir_colors = {"bullish": "green", "bearish": "red", "neutral": "yellow"}
+    dir_color = dir_colors.get(stats.direction, "white")
 
     signal_text = Text()
-    signal_text.append(f"\n  Signal: ", style="bold white")
-    signal_text.append(f"{direction}", style=f"bold {dir_color}")
-    signal_text.append(f" | Confidence: ", style="bold white")
-    signal_text.append(f"{confidence:.1%}", style=f"bold {_score_color(confidence)}")
-    signal_text.append(f" | Historical Edge: ", style="bold white")
-    edge_color = "green" if profile.avg_return_after > 0 else "red"
-    signal_text.append(f"{profile.avg_return_after:+.3f}%", style=f"bold {edge_color}")
+    signal_text.append("\n  Signal: ", style="bold white")
+    signal_text.append(stats.direction.upper(), style=f"bold {dir_color}")
+    signal_text.append(" | Confidence: ", style="bold white")
+    signal_text.append(f"{stats.confidence:.1%}", style=f"bold {_score_color(stats.confidence)}")
+    signal_text.append(" | Historical Edge: ", style="bold white")
+    edge_color = "green" if stats.edge_pct > 0 else "red"
+    signal_text.append(f"{stats.edge_pct:+.3f}%", style=f"bold {edge_color}")
+
+    signal_text.append(f"\n  Sample: {stats.wins}/{stats.n} positive", style="dim")
+    signal_text.append(" | p-value: ", style="dim")
+    p_color = "green" if stats.significant else "yellow"
+    signal_text.append(f"{stats.p_value:.3f}", style=f"bold {p_color}")
+    signal_text.append(" (significant)" if stats.significant else " (not significant at 10%)",
+                       style="dim")
+
+    if stats.baseline is not None:
+        signal_text.append(
+            f"\n  Baseline: {stats.baseline.win_rate:.0%} of all "
+            f"{stats.baseline.horizon_days}d windows positive, "
+            f"avg {stats.baseline.mean_return_pct:+.2f}%",
+            style="dim",
+        )
+        if stats.excess_edge_pct is not None:
+            excess_color = "green" if stats.excess_edge_pct > 0 else "red"
+            signal_text.append(" | Excess edge: ", style="dim")
+            signal_text.append(f"{stats.excess_edge_pct:+.3f}%", style=f"bold {excess_color}")
 
     console.print(Panel(signal_text, title="[bold]Trading Signal[/bold]", border_style="cyan"))
 

@@ -38,7 +38,14 @@ class DataProvider(ABC):
 
 
 class YFinanceProvider(DataProvider):
-    """Yahoo Finance data via yfinance."""
+    """Yahoo Finance data via yfinance.
+
+    Caches responses in-process: commands like dashboard/analyze fetch
+    overlapping ranges for the same ticker many times per run.
+    """
+
+    def __init__(self):
+        self._cache: dict[tuple[str, date, date], pd.DataFrame] = {}
 
     def name(self) -> str:
         return "Yahoo Finance"
@@ -46,6 +53,11 @@ class YFinanceProvider(DataProvider):
     def get_daily_ohlcv(
         self, ticker: str, start: date, end: date
     ) -> pd.DataFrame:
+        cache_key = (ticker, start, end)
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached.copy()
+
         # yfinance end is exclusive, add 1 day
         end_adj = end + timedelta(days=1)
         logger.info(f"Fetching {ticker} from yfinance: {start} → {end}")
@@ -60,7 +72,8 @@ class YFinanceProvider(DataProvider):
         df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
         df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
         df.index.name = "Date"
-        return df
+        self._cache[cache_key] = df
+        return df.copy()
 
 
 class IBKRProvider(DataProvider):
@@ -195,6 +208,18 @@ def fetch_event_window(
     event_idx = df.index.searchsorted(pd.Timestamp(event_date))
     if event_idx >= len(df):
         event_idx = len(df) - 1
+
+    # The anchor must actually be near the event date. When it isn't — the
+    # event is in the future, or predates the ticker's history — the clamped
+    # index silently re-anchors the window to the data boundary, producing a
+    # window that has nothing to do with the event (and, for future events,
+    # a near-duplicate of "today" that scores ~1.0 similarity).
+    anchor_date = df.index[event_idx].date()
+    if abs((anchor_date - event_date).days) > 7:
+        raise ValueError(
+            f"No trading data near event date {event_date} for {ticker} "
+            f"(nearest available: {anchor_date})"
+        )
 
     # Get window indices
     start_idx = max(0, event_idx - days_before)

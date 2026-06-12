@@ -169,12 +169,21 @@ def detect_regime(
 ) -> tuple:
     """Train GaussianHMM with multiple random restarts, return best fit.
 
+    Features are z-scored before fitting: raw features span wildly different
+    scales (log returns ~0.01 next to binary trend flags), which conditions
+    the full covariance matrices badly and hurts convergence.
+
     Returns:
-        (model, states_array, log_likelihood, converged)
+        (model, states_array, log_likelihood, converged, X_scaled)
     """
     from hmmlearn.hmm import GaussianHMM
 
-    X = features.values
+    X_raw = features.values
+    mu = X_raw.mean(axis=0)
+    sigma = X_raw.std(axis=0)
+    sigma[sigma < 1e-12] = 1.0  # constant feature: leave centered at 0
+    X = (X_raw - mu) / sigma
+
     best_model = None
     best_ll = -np.inf
     best_converged = False
@@ -204,7 +213,7 @@ def detect_regime(
         raise RuntimeError("All HMM fits failed")
 
     states = best_model.predict(X)
-    return best_model, states, best_ll, best_converged
+    return best_model, states, best_ll, best_converged, X
 
 
 # ── Regime Labeling ─────────────────────────────────────────────────────────
@@ -212,27 +221,43 @@ def detect_regime(
 REGIME_LABELS = ["Bull-Trend", "Bear-Trend", "Low-Vol-Range", "High-Vol-Stress"]
 
 
-def label_regimes(model, features: pd.DataFrame) -> dict[int, str]:
+def _empirical_state_stats(
+    features: pd.DataFrame, states: np.ndarray, n_states: int,
+) -> list[tuple[int, float, float, float]]:
+    """Per-state (state_id, mean_return, mean_volatility, mean_vix_ratio)
+    computed from the raw feature values, so stats stay in natural units
+    regardless of any scaling applied before HMM fitting."""
+    col_names = list(features.columns)
+    ret_col = "log_ret" if "log_ret" in col_names else col_names[0]
+    vol_col = "rolling_vol_20" if "rolling_vol_20" in col_names else (
+        col_names[1] if len(col_names) > 1 else col_names[0])
+    vix_col = "vix_ratio" if "vix_ratio" in col_names else None
+
+    stats = []
+    for s in range(n_states):
+        mask = states == s
+        if mask.any():
+            mean_ret = float(features.loc[mask, ret_col].mean())
+            mean_vol = float(features.loc[mask, vol_col].mean())
+            mean_vix = float(features.loc[mask, vix_col].mean()) if vix_col else 1.0
+        else:
+            mean_ret, mean_vol, mean_vix = 0.0, 0.0, 1.0
+        stats.append((s, mean_ret, mean_vol, mean_vix))
+    return stats
+
+
+def label_regimes(features: pd.DataFrame, states: np.ndarray, n_states: int) -> dict[int, str]:
     """Map HMM state IDs to human-readable regime labels.
 
     Strategy:
-    - Extract mean_return and mean_volatility per state from model.means_
+    - Compute mean_return and mean_volatility per state empirically
     - Sort by mean_return descending
     - Top return -> Bull-Trend
     - Bottom return: if high vol -> High-Vol-Stress, else Bear-Trend
     - Remaining two: lower vol -> Low-Vol-Range, other gets remaining label
     """
-    n_states = model.n_components
-    col_names = list(features.columns)
-
-    ret_idx = col_names.index("log_ret") if "log_ret" in col_names else 0
-    vol_idx = col_names.index("rolling_vol_20") if "rolling_vol_20" in col_names else 1
-
-    state_stats = []
-    for s in range(n_states):
-        mean_ret = model.means_[s][ret_idx]
-        mean_vol = model.means_[s][vol_idx] if vol_idx < len(model.means_[s]) else 0
-        state_stats.append((s, mean_ret, mean_vol))
+    state_stats = [(s, ret, vol) for s, ret, vol, _ in
+                   _empirical_state_stats(features, states, n_states)]
 
     # Sort by mean return descending
     state_stats.sort(key=lambda x: x[1], reverse=True)
@@ -309,10 +334,10 @@ def run_regime_detection(
         logger.warning(f"Only {len(features)} observations — results may be noisy (recommend >= 200)")
 
     # Detect regimes
-    model, states, log_likelihood, converged = detect_regime(features, n_states=n_states)
+    model, states, log_likelihood, converged, X_scaled = detect_regime(features, n_states=n_states)
 
     # Label states
-    state_labels = label_regimes(model, features)
+    state_labels = label_regimes(features, states, n_states)
 
     # Map states to labels in history
     regime_labels = [state_labels.get(s, f"State-{s}") for s in states]
@@ -324,25 +349,19 @@ def run_regime_detection(
     # Current regime
     current_regime = regime_labels[-1]
 
-    # Posterior probabilities for current day
-    proba = model.predict_proba(features.values)[-1]
+    # Posterior probabilities for current day (model was fit on scaled features)
+    proba = model.predict_proba(X_scaled)[-1]
     probabilities = {}
     for s_id, prob in enumerate(proba):
         label = state_labels.get(s_id, f"State-{s_id}")
         probabilities[label] = float(prob)
 
-    # VIX ratio feature index for state summaries
-    col_names = list(features.columns)
-    vix_idx = col_names.index("vix_ratio") if "vix_ratio" in col_names else None
-
-    # Build state summaries
+    # Build state summaries from empirical per-state feature means
     state_summaries = []
-    for s_id in range(n_states):
+    empirical = _empirical_state_stats(features, states, n_states)
+    for s_id, mean_ret, mean_vol, mean_vix in empirical:
         mask = states == s_id
         label = state_labels.get(s_id, f"State-{s_id}")
-        mean_ret = float(model.means_[s_id][0])  # log_ret
-        mean_vol = float(model.means_[s_id][1]) if model.means_.shape[1] > 1 else 0.0
-        mean_vix = float(model.means_[s_id][vix_idx]) if vix_idx is not None else 1.0
         freq = float(np.sum(mask) / len(mask) * 100)
 
         state_summaries.append(RegimeState(

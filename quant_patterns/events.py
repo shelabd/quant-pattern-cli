@@ -217,12 +217,15 @@ class EventCatalog:
     """Manages built-in + custom events with filtering and search."""
 
     def __init__(self, custom_events_path: Optional[Path] = None,
-                 potus_cache_path: Optional[Path] = None):
+                 potus_cache_path: Optional[Path] = None,
+                 macro_cache_path: Optional[Path] = None):
         self.events: list[MarketEvent] = list(BUILTIN_EVENTS)
         self.custom_path = custom_events_path or Path.home() / ".qpat" / "custom_events.json"
         self.potus_cache_path = potus_cache_path or Path.home() / ".qpat" / "potus_events.json"
+        self.macro_cache_path = macro_cache_path or Path.home() / ".qpat" / "macro_calendar.json"
         self._load_custom()
         self._load_potus_cache()
+        self._load_macro_cache()
 
     def _load_custom(self):
         if self.custom_path.exists():
@@ -243,6 +246,47 @@ class EventCatalog:
                     if evt.key not in existing_keys:
                         self.events.append(evt)
                         existing_keys.add(evt.key)
+            except Exception:
+                pass
+
+    def _load_macro_cache(self):
+        """Load macro calendar cache into the event catalog.
+
+        Converts cached release dates into MarketEvent objects so they
+        appear in catalog.search().  Follows the same pattern as
+        _load_potus_cache().
+        """
+        if self.macro_cache_path.exists():
+            try:
+                data = json.loads(self.macro_cache_path.read_text())
+                releases = data.get("releases", {})
+                existing_keys = {e.key for e in self.events}
+                category_labels = {
+                    "cpi": "CPI Release",
+                    "ppi": "PPI Release",
+                    "fomc": "FOMC Decision",
+                    "nfp": "Non-Farm Payrolls",
+                    "gdp": "GDP Release",
+                    "retail_sales": "Retail Sales",
+                }
+                for cat_val, date_strs in releases.items():
+                    try:
+                        cat = EventCategory(cat_val)
+                    except ValueError:
+                        continue
+                    label = category_labels.get(cat_val, cat_val.upper())
+                    for ds in date_strs:
+                        evt_date = datetime.strptime(ds, "%Y-%m-%d").date()
+                        name = f"{label} {evt_date.strftime('%b %Y')}"
+                        evt = MarketEvent(
+                            name=name,
+                            date=evt_date,
+                            category=cat,
+                            description="Auto-synced from macro calendar",
+                        )
+                        if evt.key not in existing_keys:
+                            self.events.append(evt)
+                            existing_keys.add(evt.key)
             except Exception:
                 pass
 

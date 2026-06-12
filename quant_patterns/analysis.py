@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 from scipy.signal import argrelextrema
 from scipy.spatial.distance import euclidean
-from scipy.stats import pearsonr
+from scipy.stats import binomtest, pearsonr
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,24 @@ class Level:
     @property
     def label(self) -> str:
         return f"{'S' if self.kind == 'support' else 'R'} @ {self.price:.2f} (touches={self.touches}, str={self.strength:.2f})"
+
+
+def _collapse_extrema_runs(indices: np.ndarray) -> np.ndarray:
+    """Collapse runs of consecutive extrema indices (flat plateaus) to a single
+    representative index, so one swing isn't counted as multiple touches."""
+    if len(indices) == 0:
+        return indices
+    groups = []
+    start = prev = int(indices[0])
+    for i in indices[1:]:
+        i = int(i)
+        if i == prev + 1:
+            prev = i
+            continue
+        groups.append((start + prev) // 2)
+        start = prev = i
+    groups.append((start + prev) // 2)
+    return np.array(groups)
 
 
 def find_support_resistance(
@@ -62,8 +80,8 @@ def find_support_resistance(
         return []
 
     # Find local minima (support) and maxima (resistance)
-    local_min_idx = argrelextrema(close, np.less_equal, order=window)[0]
-    local_max_idx = argrelextrema(close, np.greater_equal, order=window)[0]
+    local_min_idx = _collapse_extrema_runs(argrelextrema(close, np.less_equal, order=window)[0])
+    local_max_idx = _collapse_extrema_runs(argrelextrema(close, np.greater_equal, order=window)[0])
 
     levels: list[Level] = []
 
@@ -153,14 +171,23 @@ class SimilarityResult:
             return "Weak"
 
 
-def _simple_dtw(s1: np.ndarray, s2: np.ndarray) -> float:
-    """Simple DTW implementation without external dependencies."""
+def _simple_dtw(s1: np.ndarray, s2: np.ndarray, band_radius: Optional[int] = None) -> float:
+    """Simple DTW implementation without external dependencies.
+
+    Uses a Sakoe-Chiba band to bound warping: unconstrained DTW permits
+    degenerate alignments (e.g. a series matching its own reversal cheaply).
+    The band must be at least the length difference so a path always exists.
+    """
     n, m = len(s1), len(s2)
+    if band_radius is None:
+        band_radius = max(3, max(n, m) // 4)
+    w = max(band_radius, abs(n - m))
+
     dtw_matrix = np.full((n + 1, m + 1), np.inf)
     dtw_matrix[0, 0] = 0
 
     for i in range(1, n + 1):
-        for j in range(1, m + 1):
+        for j in range(max(1, i - w), min(m, i + w) + 1):
             cost = abs(s1[i - 1] - s2[j - 1])
             dtw_matrix[i, j] = cost + min(
                 dtw_matrix[i - 1, j],
@@ -201,8 +228,10 @@ def compare_windows(
             window_data=historical,
         )
 
-    # Pearson correlation
+    # Pearson correlation (NaN for constant series — treat as no relationship)
     corr, _ = pearsonr(t_clean, h_clean)
+    if np.isnan(corr):
+        corr = 0.0
     corr = max(-1, min(1, corr))  # clamp
 
     # Euclidean distance (normalized by length)
@@ -225,10 +254,18 @@ def compare_windows(
     h_vol = np.std(h_clean) if np.std(h_clean) > 0 else 1e-10
     vol_ratio = min(t_vol, h_vol) / max(t_vol, h_vol)
 
-    # Composite score: weighted combination
+    # Composite score: weighted combination.
+    # Distance scores are normalized by the windows' combined dispersion so
+    # they stay comparable across tickers and volatility regimes (a fixed
+    # divisor saturates for high-vol series and inflates for quiet ones).
     corr_score = (corr + 1) / 2  # map [-1, 1] to [0, 1]
-    euc_score = max(0, 1 - euc / 10)  # higher is better
-    dtw_score = max(0, 1 - dtw_norm / 10)
+    dispersion = float(np.std(t_clean) + np.std(h_clean))
+    if dispersion > 1e-12:
+        euc_score = max(0, 1 - euc / dispersion)
+        dtw_score = max(0, 1 - dtw_norm / dispersion)
+    else:
+        # Both series flat: identical flats are a perfect match
+        euc_score = dtw_score = 1.0 if euc < 1e-12 else 0.0
 
     composite = (
         0.30 * corr_score
@@ -268,6 +305,7 @@ class PatternProfile:
     avg_volume_change: float   # avg % volume change on event day vs prior
     best_match: Optional[SimilarityResult] = None
     all_matches: list[SimilarityResult] = field(default_factory=list)
+    returns_after_list: list[float] = field(default_factory=list)  # raw per-event post returns (%)
 
     def to_dict(self) -> dict:
         return {
@@ -348,6 +386,154 @@ def build_pattern_profile(
         avg_volume_change=float(np.mean(volume_changes)) if volume_changes else 0,
         best_match=best,
         all_matches=sorted(similarity_results, key=lambda s: s.composite_score, reverse=True),
+        returns_after_list=[float(r) for r in returns_after],
+    )
+
+
+# ── Signal Statistics ───────────────────────────────────────────────────────────
+
+@dataclass
+class BaselineStats:
+    """Unconditional N-day forward-return distribution for a ticker.
+
+    Serves as the null hypothesis for event signals: an event-window win rate
+    only carries information relative to how often the ticker is up over any
+    N-day stretch.
+    """
+    win_rate: float        # 0-1, fraction of horizon windows with positive return
+    mean_return_pct: float
+    n: int                 # number of (overlapping) windows measured
+    horizon_days: int
+
+    def to_dict(self) -> dict:
+        return {
+            "win_rate_pct": round(self.win_rate * 100, 1),
+            "mean_return_pct": round(self.mean_return_pct, 3),
+            "n_windows": self.n,
+            "horizon_days": self.horizon_days,
+        }
+
+
+def compute_baseline_stats(df: pd.DataFrame, horizon_days: int) -> Optional[BaselineStats]:
+    """Compute the unconditional horizon-day forward-return distribution.
+
+    Uses overlapping windows over the full DataFrame. Returns None when there
+    is too little data for a meaningful base rate.
+    """
+    if df is None or df.empty or "Close" not in df.columns:
+        return None
+    close = df["Close"].values
+    if len(close) < horizon_days + 20:
+        return None
+
+    fwd = close[horizon_days:] / close[:-horizon_days] - 1
+    fwd = fwd[~np.isnan(fwd)]
+    if len(fwd) < 20:
+        return None
+
+    return BaselineStats(
+        win_rate=float(np.mean(fwd > 0)),
+        mean_return_pct=float(np.mean(fwd) * 100),
+        n=len(fwd),
+        horizon_days=horizon_days,
+    )
+
+
+def _wilson_lower(successes: int, n: int, z: float = 1.96) -> float:
+    """Lower bound of the Wilson score interval for a binomial proportion.
+
+    Shrinks toward 0 as n falls, so small samples can't claim high confidence:
+    7/10 wins → ~0.40, 70/100 wins → ~0.60.
+    """
+    if n == 0:
+        return 0.0
+    p = successes / n
+    denom = 1 + z * z / n
+    center = p + z * z / (2 * n)
+    margin = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return max(0.0, float((center - margin) / denom))
+
+
+@dataclass
+class SignalStats:
+    """Statistically grounded trading signal derived from a PatternProfile.
+
+    confidence is the Wilson lower bound of the directional win rate — it
+    shrinks with sample size, unlike the raw win rate. p_value tests the win
+    count against the baseline win rate (or a fair coin without a baseline).
+    """
+    direction: str           # "bullish" | "bearish" | "neutral"
+    confidence: float        # 0-1, Wilson lower bound of directional win rate
+    edge_pct: float          # avg return after event (%)
+    n: int                   # number of events with measurable post returns
+    wins: int                # events with positive post return
+    win_rate: float          # 0-1
+    p_value: float           # one-sided binomial test vs baseline (or 0.5)
+    baseline: Optional[BaselineStats] = None
+    excess_edge_pct: Optional[float] = None  # edge minus baseline mean return
+
+    @property
+    def significant(self) -> bool:
+        return self.p_value < 0.10
+
+    def to_dict(self) -> dict:
+        return {
+            "direction": self.direction,
+            "confidence": round(self.confidence, 4),
+            "historical_edge_pct": round(self.edge_pct, 3),
+            "n_events": self.n,
+            "win_rate_pct": round(self.win_rate * 100, 1),
+            "p_value": round(self.p_value, 4),
+            "significant_at_10pct": self.significant,
+            "baseline": self.baseline.to_dict() if self.baseline else None,
+            "excess_edge_pct": round(self.excess_edge_pct, 3) if self.excess_edge_pct is not None else None,
+        }
+
+
+def compute_signal_stats(
+    profile: PatternProfile,
+    baseline: Optional[BaselineStats] = None,
+) -> SignalStats:
+    """Compute the trading signal with statistical grounding.
+
+    Single source of truth for direction/confidence — replaces the raw
+    win-rate-as-confidence logic previously duplicated across modules.
+    """
+    rets = profile.returns_after_list
+    n = len(rets)
+    wins = sum(1 for r in rets if r > 0)
+    win_rate = wins / n if n else 0.0
+    edge = float(np.mean(rets)) if rets else 0.0
+
+    if n == 0:
+        return SignalStats(
+            direction="neutral", confidence=0.0, edge_pct=0.0,
+            n=0, wins=0, win_rate=0.0, p_value=1.0, baseline=baseline,
+        )
+
+    direction = "bullish" if edge > 0 else "bearish"
+    base_p = baseline.win_rate if baseline else 0.5
+    base_p = min(0.999, max(0.001, base_p))
+
+    if direction == "bullish":
+        confidence = _wilson_lower(wins, n)
+        p_value = binomtest(wins, n, base_p, alternative="greater").pvalue
+    else:
+        confidence = _wilson_lower(n - wins, n)
+        p_value = binomtest(n - wins, n, 1 - base_p, alternative="greater").pvalue
+
+    excess = edge - baseline.mean_return_pct if baseline else None
+
+    return SignalStats(
+        direction=direction,
+        confidence=confidence,
+        edge_pct=edge,
+        n=n,
+        wins=wins,
+        win_rate=win_rate,
+        p_value=float(p_value),
+        baseline=baseline,
+        excess_edge_pct=excess,
     )
 
 
@@ -421,7 +607,10 @@ def sliding_window_scan(
 
     results.sort(key=lambda r: r.composite_score, reverse=True)
 
-    # Deduplicate overlapping windows: keep highest score per cluster
+    # Deduplicate overlapping windows: keep highest score per cluster.
+    # event_date gaps are calendar days but window_size is trading days, so
+    # convert (~7 calendar days per 5 trading days) before comparing.
+    min_calendar_gap = int(np.ceil(window_size * 7 / 5))
     if results:
         filtered = [results[0]]
         for r in results[1:]:
@@ -429,7 +618,7 @@ def sliding_window_scan(
             for kept in filtered:
                 if kept.event_date and r.event_date:
                     gap = abs((kept.event_date - r.event_date).days)
-                    if gap < window_size:
+                    if gap < min_calendar_gap:
                         too_close = True
                         break
             if not too_close:
@@ -931,10 +1120,13 @@ def export_for_agent(
     target_window: pd.DataFrame,
     volume_price: Optional[VolumePriceProfile] = None,
     regime: Optional[dict] = None,
+    signal_stats: Optional[SignalStats] = None,
 ) -> dict:
     """
     Export analysis results in a structured format for downstream quant agent consumption.
     """
+    if signal_stats is None:
+        signal_stats = compute_signal_stats(profile)
     sr_data = [
         {
             "price": l.price,
@@ -969,12 +1161,7 @@ def export_for_agent(
             "end": target_window.index[-1].isoformat() if len(target_window) > 0 else None,
             "prices": target_window["Close"].tolist() if "Close" in target_window.columns else [],
         },
-        "signal": {
-            "direction": "bullish" if profile.avg_return_after > 0 else "bearish",
-            "confidence": min(1.0, profile.positive_after_pct / 100 if profile.avg_return_after > 0
-                            else (100 - profile.positive_after_pct) / 100),
-            "historical_edge_pct": round(profile.avg_return_after, 3),
-        },
+        "signal": signal_stats.to_dict(),
         "volume_price_authenticity": volume_price.to_dict() if volume_price else None,
         "regime": regime,
     }

@@ -11,6 +11,18 @@ from quant_patterns.data import DataProvider
 from quant_patterns.events import EventCatalog, EventCategory, MarketEvent
 
 
+# ── Isolation ─────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path_factory, monkeypatch):
+    """Point HOME at a temp dir so EventCatalog never loads the real
+    ~/.qpat caches (custom/potus/macro) — test results must not depend on
+    machine state."""
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+
+
 # ── Mock Data Provider ────────────────────────────────────────────────────────
 
 

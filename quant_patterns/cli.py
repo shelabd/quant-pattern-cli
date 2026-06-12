@@ -29,6 +29,8 @@ from .analysis import (
     build_pattern_profile,
     build_volume_profile,
     compare_windows,
+    compute_baseline_stats,
+    compute_signal_stats,
     export_for_agent,
     find_support_resistance,
     sliding_window_scan,
@@ -207,6 +209,18 @@ def _compare_events(
             progress.advance(task)
 
     return windows, similarity_results
+
+
+def _compute_baseline(dp: DataProvider, ticker: str, t_date: date, horizon_days: int):
+    """Fetch ~3y of history and compute the unconditional forward-return base
+    rate for the signal's horizon. Returns None on any failure — the signal
+    then falls back to a fair-coin null."""
+    try:
+        base_df = dp.get_daily_ohlcv(ticker, t_date - timedelta(days=1095), t_date)
+        return compute_baseline_stats(base_df, horizon_days=horizon_days)
+    except Exception as e:
+        logger.warning(f"Baseline computation failed for {ticker}: {e}")
+        return None
 
 
 def _fetch_target_window(
@@ -404,14 +418,17 @@ _TICKER_CATEGORY_HEURISTICS: dict[str, EventCategory] = {
 def _auto_detect_event_category(
     ticker: str,
     catalog: EventCatalog,
+    reference_date: Optional[date] = None,
 ) -> Optional[EventCategory]:
-    """Pick the best event category for *ticker* automatically.
+    """Pick the best event category for *ticker* using proximity awareness.
 
     Priority:
-    1. Ticker-specific events (e.g. NVDA → EARNINGS)
-    2. Hard-coded heuristics (SPY → FOMC, XLE → OPEC, BTC-USD → CRYPTO)
-    3. Most-common category in catalog that matches the ticker
-    4. None (skip event analysis)
+    1. Ticker-specific catalog events (e.g. NVDA → EARNINGS) — a ticker's own
+       events dominate its price behavior, so they outrank macro proximity
+    2. Nearest upcoming macro event via macro calendar (FRED / FOMC / earnings)
+    3. Hard-coded heuristics (SPY → FOMC, XLE → OPEC, BTC-USD → CRYPTO)
+    4. Most-common category in catalog that matches the ticker
+    5. None (skip event analysis)
     """
     # 1. Ticker-specific events
     ticker_events = [e for e in catalog.events if e.ticker_specific == ticker]
@@ -420,11 +437,25 @@ def _auto_detect_event_category(
         most_common = Counter(e.category for e in ticker_events).most_common(1)
         return most_common[0][0]
 
-    # 2. Heuristic map
+    # 2. Proximity-based detection via macro calendar
+    try:
+        from .macro_calendar import find_nearest_macro_event
+        nearest = find_nearest_macro_event(ticker, reference_date)
+        if nearest:
+            logger.info(
+                "Auto-detect: nearest macro event for %s is %s on %s (%+d days, source=%s)",
+                ticker, nearest.category.value, nearest.event_date,
+                nearest.distance_days, nearest.source,
+            )
+            return nearest.category
+    except Exception as e:
+        logger.debug("Macro calendar lookup failed: %s", e)
+
+    # 3. Heuristic map
     if ticker in _TICKER_CATEGORY_HEURISTICS:
         return _TICKER_CATEGORY_HEURISTICS[ticker]
 
-    # 3. Most-common broad-market category
+    # 4. Most-common broad-market category
     broad = catalog.search(ticker=ticker)
     if broad:
         from collections import Counter
@@ -515,25 +546,28 @@ def _build_dashboard_signal(
     scan_fwd: dict,
     vp,
     regime_result=None,
+    event_stats=None,
+    baseline=None,
 ) -> dict:
     """Synthesize overall signal from event, scan, and vprofile analyses.
 
     Returns dict with keys: event, scan, vprofile, overall_direction, overall_confidence.
     """
     signal: dict = {"event": None, "scan": None, "vprofile": None}
-    votes: list[tuple[str, float]] = []  # (direction, weight)
+    votes: list[tuple[str, float, float]] = []  # (direction, confidence, component_weight)
 
-    # Event signal
+    # Event signal — statistically grounded (Wilson-shrunk confidence)
     if event_profile is not None:
-        direction = "bullish" if event_profile.avg_return_after > 0 else "bearish"
-        confidence = min(1.0, event_profile.positive_after_pct / 100 if direction == "bullish"
-                         else (100 - event_profile.positive_after_pct) / 100)
+        stats = event_stats or compute_signal_stats(event_profile, baseline)
         signal["event"] = {
-            "direction": direction,
-            "confidence": confidence,
-            "edge": round(event_profile.avg_return_after, 3),
+            "direction": stats.direction,
+            "confidence": round(stats.confidence, 4),
+            "edge": round(stats.edge_pct, 3),
+            "n_events": stats.n,
+            "p_value": round(stats.p_value, 4),
         }
-        votes.append((direction, confidence * 0.40))
+        if stats.direction != "neutral":
+            votes.append((stats.direction, stats.confidence, 0.40))
 
     # Scan signal
     if scan_fwd:
@@ -551,7 +585,7 @@ def _build_dashboard_signal(
             "confidence": confidence,
             "edge": round(horizon_ret, 3),
         }
-        votes.append((direction, confidence * 0.35))
+        votes.append((direction, confidence, 0.35))
 
     # Volume profile signal
     if vp is not None:
@@ -561,8 +595,10 @@ def _build_dashboard_signal(
         elif vp.position == "below_val":
             direction = "bearish"
         else:
-            # Inside value area — use POC distance as tiebreaker
-            direction = "bullish" if vp.poc_distance_pct > 0 else "bearish"
+            # Inside value area the POC acts as a mean-reversion magnet
+            # (consistent with the vprofile signal text): above POC implies
+            # pull lower, below POC implies pull higher.
+            direction = "bearish" if vp.poc_distance_pct > 0 else "bullish"
 
         # AVWAP consensus
         if vp.anchored_vwaps:
@@ -578,16 +614,18 @@ def _build_dashboard_signal(
             "confidence": confidence,
             "edge": round(vp.poc_distance_pct, 3),
         }
-        votes.append((direction, confidence * 0.25))
+        votes.append((direction, confidence, 0.25))
 
-    # Weighted majority vote
+    # Weighted vote. Normalize by the total weight of components present, not
+    # by the vote mass: a lone component then reports its own confidence
+    # instead of an unconditional 1.0, and disagreement drags the score down.
     if votes:
-        bull_weight = sum(w for d, w in votes if d == "bullish")
-        bear_weight = sum(w for d, w in votes if d == "bearish")
-        total = bull_weight + bear_weight
-        if total > 0:
+        bull_weight = sum(c * w for d, c, w in votes if d == "bullish")
+        bear_weight = sum(c * w for d, c, w in votes if d == "bearish")
+        total_possible = sum(w for _, _, w in votes)
+        if total_possible > 0 and (bull_weight or bear_weight):
             signal["overall_direction"] = "bullish" if bull_weight >= bear_weight else "bearish"
-            signal["overall_confidence"] = max(bull_weight, bear_weight) / total
+            signal["overall_confidence"] = max(bull_weight, bear_weight) / total_possible
         else:
             signal["overall_direction"] = "neutral"
             signal["overall_confidence"] = 0
@@ -711,8 +749,9 @@ def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
     display_ticker_info(fetch_ticker_info(ticker))
     console.print()
 
-    # Get relevant events
-    events = catalog.search(category=category, ticker=search_ticker)
+    # Get relevant events. Future-dated events (macro-calendar sync) have no
+    # price history yet and cannot be compared against.
+    events = catalog.search(category=category, ticker=search_ticker, end=date.today())
     if not events:
         console.print(f"[red]No {event_type} events found for {ticker}[/red]")
         return
@@ -762,9 +801,11 @@ def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
     console.print()
     vp_profile = _compute_volume_price(target_window, ticker, show_daily=True)
 
-    # Build and display profile
+    # Build and display profile with statistically grounded signal
     profile = build_pattern_profile(ticker, event_type, windows, similarity_results)
-    display_pattern_profile(profile)
+    baseline = _compute_baseline(dp, ticker, t_date, days_after)
+    signal_stats = compute_signal_stats(profile, baseline)
+    display_pattern_profile(profile, signal_stats=signal_stats)
 
     # Regime-conditional win rates
     if regime_filter and regime_result is not None:
@@ -779,7 +820,8 @@ def analyze(ticker, event_type, days_before, days_after, target_date, top_n,
     if export_json:
         regime_data = regime_result.to_dict() if regime_result else None
         export_data = export_for_agent(profile, sr_levels, target_window,
-                                       volume_price=vp_profile, regime=regime_data)
+                                       volume_price=vp_profile, regime=regime_data,
+                                       signal_stats=signal_stats)
         path = Path(export_json)
         path.write_text(json.dumps(export_data, indent=2, default=str))
         console.print(f"\n[green]✓ Exported to {path}[/green]")
@@ -1438,6 +1480,112 @@ def events_add(name, event_date, category, description, ticker):
     console.print(f"[green]✓ Added custom event: {event.name} ({event.date})[/green]")
 
 
+@events.command("sync-calendar")
+@click.option("--force", "-f", is_flag=True, default=False, help="Force refresh (ignore cache TTL)")
+def events_sync_calendar(force):
+    """Sync macro calendar from FRED API + FOMC schedule.
+
+    Fetches upcoming release dates for CPI, PPI, NFP, GDP, Retail Sales
+    from FRED, plus hardcoded FOMC dates. Results are cached for 24 hours.
+
+    Requires a FRED API key — set via: qpat config set fred-api-key <KEY>
+    """
+    from .macro_calendar import sync_macro_calendar, get_fred_api_key
+
+    api_key = get_fred_api_key()
+    if not api_key:
+        console.print("[yellow]⚠ No FRED API key configured.[/yellow]")
+        console.print("  FOMC dates are always available (hardcoded).")
+        console.print("  For CPI/PPI/NFP/GDP/Retail Sales, run:")
+        console.print("  [cyan]qpat config set fred-api-key <YOUR_KEY>[/cyan]\n")
+
+    with Progress(SpinnerColumn(), TextColumn("[bold blue]Syncing macro calendar...")) as progress:
+        progress.add_task("sync", total=None)
+        releases = sync_macro_calendar(force=force)
+
+    if not releases:
+        console.print("[red]No release dates fetched.[/red]")
+        return
+
+    console.print("[green]✓ Macro calendar synced[/green]\n")
+    for cat_val, dates in sorted(releases.items()):
+        label = cat_val.upper().replace("_", " ")
+        upcoming = [d for d in dates if d >= date.today().isoformat()]
+        console.print(f"  [bold]{label}[/bold]: {len(upcoming)} upcoming dates")
+        for d in upcoming[:3]:
+            console.print(f"    {d}")
+        if len(upcoming) > 3:
+            console.print(f"    ... and {len(upcoming) - 3} more")
+    console.print()
+
+
+# ── CONFIG command ─────────────────────────────────────────────────────────────
+
+@cli.group()
+def config():
+    """Manage qpat configuration (API keys, preferences)."""
+    pass
+
+
+@config.command("set")
+@click.argument("key")
+@click.argument("value")
+def config_set(key, value):
+    """Set a configuration value.
+
+    Example: qpat config set fred-api-key YOUR_API_KEY
+    """
+    from .macro_calendar import load_config, save_config
+
+    cfg = load_config()
+    # Normalize key: fred-api-key → fred_api_key
+    storage_key = key.replace("-", "_")
+    cfg[storage_key] = value
+    save_config(cfg)
+    console.print(f"[green]✓ Set {key}[/green]")
+
+
+@config.command("get")
+@click.argument("key")
+def config_get(key):
+    """Get a configuration value (sensitive values are masked).
+
+    Example: qpat config get fred-api-key
+    """
+    from .macro_calendar import load_config
+
+    cfg = load_config()
+    storage_key = key.replace("-", "_")
+    val = cfg.get(storage_key)
+    if val is None:
+        console.print(f"[yellow]{key} is not set[/yellow]")
+    elif "key" in key.lower() or "secret" in key.lower() or "token" in key.lower():
+        masked = val[:4] + "..." + val[-4:] if len(val) > 8 else "****"
+        console.print(f"  {key} = {masked}")
+    else:
+        console.print(f"  {key} = {val}")
+
+
+@config.command("show")
+def config_show():
+    """Show all configuration values."""
+    from .macro_calendar import load_config
+
+    cfg = load_config()
+    if not cfg:
+        console.print("[yellow]No configuration set.[/yellow]")
+        console.print("  Run: [cyan]qpat config set fred-api-key <KEY>[/cyan]")
+        return
+
+    for k, v in cfg.items():
+        display_key = k.replace("_", "-")
+        if "key" in k or "secret" in k or "token" in k:
+            masked = v[:4] + "..." + v[-4:] if len(str(v)) > 8 else "****"
+            console.print(f"  {display_key} = {masked}")
+        else:
+            console.print(f"  {display_key} = {v}")
+
+
 # ── EXPORT command ──────────────────────────────────────────────────────────────
 
 @cli.command()
@@ -1466,7 +1614,7 @@ def export(ticker, event_type, output, days_before, days_after, event_ticker, pr
     catalog = EventCatalog()
     search_ticker = event_ticker.upper() if event_ticker else ticker
 
-    events_list = catalog.search(category=category, ticker=search_ticker)
+    events_list = catalog.search(category=category, ticker=search_ticker, end=date.today())
     if not events_list:
         console.print(f"[red]No events found[/red]")
         return
@@ -1488,6 +1636,8 @@ def export(ticker, event_type, output, days_before, days_after, event_ticker, pr
     sr_levels = find_support_resistance(broad_df)
 
     profile = build_pattern_profile(ticker, event_type, windows, similarity_results)
+    baseline = _compute_baseline(dp, ticker, t_date, days_after)
+    signal_stats = compute_signal_stats(profile, baseline)
 
     # Volume-Price Authenticity
     vp_profile = _compute_volume_price(target_window, ticker, show_daily=False)
@@ -1497,7 +1647,8 @@ def export(ticker, event_type, output, days_before, days_after, event_ticker, pr
         console.print()
         _run_event_forecast(similarity_results, target_window, ticker, catalog, category, dp)
 
-    export_data = export_for_agent(profile, sr_levels, target_window, volume_price=vp_profile)
+    export_data = export_for_agent(profile, sr_levels, target_window, volume_price=vp_profile,
+                                   signal_stats=signal_stats)
 
     path = Path(output)
     path.write_text(json.dumps(export_data, indent=2, default=str))
@@ -1542,7 +1693,7 @@ def interactive(provider, verbose):
     t_date = date.today() if target_str == "today" else datetime.strptime(target_str, "%Y-%m-%d").date()
 
     # Step 5: Specific event or all?
-    all_events = catalog.search(category=category, ticker=ticker)
+    all_events = catalog.search(category=category, ticker=ticker, end=date.today())
     if not all_events:
         console.print(f"[red]No events found for {category.value} + {ticker}[/red]")
         return
@@ -1599,7 +1750,8 @@ def interactive(provider, verbose):
 
     if windows and similarity_results:
         profile = build_pattern_profile(ticker, cat_choice, windows, similarity_results)
-        display_pattern_profile(profile)
+        signal_stats = compute_signal_stats(profile, _compute_baseline(dp, ticker, t_date, days_after))
+        display_pattern_profile(profile, signal_stats=signal_stats)
 
         # Day-by-day forecast
         console.print()
@@ -1609,7 +1761,8 @@ def interactive(provider, verbose):
     if Prompt.ask("\n[bold]Export to JSON?", choices=["y", "n"], default="n") == "y":
         out = Prompt.ask("[bold]Output file", default=f"{ticker.lower()}_{cat_choice}_analysis.json")
         if windows and similarity_results:
-            export_data = export_for_agent(profile, sr_levels, target_window, volume_price=vp_profile)
+            export_data = export_for_agent(profile, sr_levels, target_window, volume_price=vp_profile,
+                                           signal_stats=signal_stats)
             Path(out).write_text(json.dumps(export_data, indent=2, default=str))
             console.print(f"[green]✓ Exported to {out}[/green]")
 
@@ -1709,8 +1862,8 @@ def dashboard(ticker, event_type, days, lookback, top_n, bins, regime, target_da
     end = datetime.strptime(target_date, "%Y-%m-%d").date() if target_date else date.today()
     start = end - timedelta(days=lookback)
 
-    # Auto-detect event category
-    category = EventCategory(event_type) if event_type else _auto_detect_event_category(ticker, catalog)
+    # Auto-detect event category (proximity-aware)
+    category = EventCategory(event_type) if event_type else _auto_detect_event_category(ticker, catalog, reference_date=end)
     cat_label = category.value.upper() if category else "NONE"
 
     console.print(f"\n[bold cyan]⚡ Dashboard: {ticker}[/bold cyan]")
@@ -1784,9 +1937,11 @@ def dashboard(ticker, event_type, days, lookback, top_n, bins, regime, target_da
     # ══════════════════════════════════════════════════════════════════════
     event_profile = None
     event_similarity_results = []
+    event_baseline = None
+    event_signal_stats = None
 
     if category:
-        events = catalog.search(category=category, ticker=ticker)
+        events = catalog.search(category=category, ticker=ticker, end=date.today())
         if events:
             console.print()
             console.print(Rule(f"[bold magenta]Event Analysis — {cat_label}"))
@@ -1817,7 +1972,9 @@ def dashboard(ticker, event_type, days, lookback, top_n, bins, regime, target_da
                         event_profile = build_pattern_profile(
                             ticker, category.value, windows, event_similarity_results,
                         )
-                        display_pattern_profile(event_profile)
+                        event_baseline = compute_baseline_stats(df, horizon_days=days)
+                        event_signal_stats = compute_signal_stats(event_profile, event_baseline)
+                        display_pattern_profile(event_profile, signal_stats=event_signal_stats)
 
                         # Event forecast
                         console.print()
@@ -1871,7 +2028,8 @@ def dashboard(ticker, event_type, days, lookback, top_n, bins, regime, target_da
     console.print()
     console.print(Rule("[bold magenta]Signal Summary"))
 
-    signal = _build_dashboard_signal(event_profile, scan_results, scan_fwd, vp, regime_result)
+    signal = _build_dashboard_signal(event_profile, scan_results, scan_fwd, vp, regime_result,
+                                     event_stats=event_signal_stats, baseline=event_baseline)
     display_dashboard_signal(signal, ticker)
 
     # ── Export ─────────────────────────────────────────────────────────────

@@ -145,11 +145,23 @@ quant_patterns/
   ],
   "signal": {
     "direction": "bullish",
-    "confidence": 0.70,
-    "historical_edge_pct": 0.891
+    "confidence": 0.41,
+    "historical_edge_pct": 0.891,
+    "n_events": 10,
+    "win_rate_pct": 70.0,
+    "p_value": 0.382,
+    "significant_at_10pct": false,
+    "baseline": {"win_rate_pct": 63.0, "mean_return_pct": 0.39, "n_windows": 740, "horizon_days": 10},
+    "excess_edge_pct": 0.501
   }
 }
 ```
+
+`confidence` is the Wilson-interval lower bound of the directional win rate — it
+shrinks with sample size, so 7/10 wins reads ~0.40 while 70/100 reads ~0.60.
+`p_value` is a one-sided binomial test of the win count against the ticker's
+unconditional N-day win rate (`baseline`), so an event "edge" that just matches
+the ticker's normal drift is not reported as significant.
 
 ## Data Providers
 
@@ -186,9 +198,12 @@ with open("spy_fomc.json") as f:
     data = json.load(f)
 
 signal = data["signal"]
-if signal["direction"] == "bullish" and signal["confidence"] > 0.6:
+if (signal["direction"] == "bullish"
+        and signal["significant_at_10pct"]
+        and (signal["excess_edge_pct"] or 0) > 0):
     # Your trading logic here
-    print(f"BUY signal: {signal['historical_edge_pct']}% avg edge")
+    print(f"BUY signal: {signal['excess_edge_pct']}% edge over baseline "
+          f"(p={signal['p_value']}, n={signal['n_events']})")
 ```
 
 ## Requirements
