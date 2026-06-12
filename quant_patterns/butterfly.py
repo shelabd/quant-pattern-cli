@@ -108,7 +108,9 @@ class FlyRecommendation:
     min_rr: float = DEFAULT_MIN_RR
 
     def to_dict(self) -> dict:
-        per_fly = (lambda v: round(v * 100, 2) if v is not None else None)
+        def per_fly(v: Optional[float]) -> Optional[float]:
+            return round(v * 100, 2) if v is not None else None
+
         d = {
             "ticker": self.ticker,
             "spot": round(self.spot, 2),
@@ -540,7 +542,7 @@ def recommend_fly(
     import yfinance as yf
     from datetime import timedelta
     from .data import get_provider
-    from .events import EventCatalog, EventCategory
+    from .events import EventCatalog
 
     ticker = ticker.upper()
     today = today or date.today()

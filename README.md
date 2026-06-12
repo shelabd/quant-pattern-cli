@@ -31,6 +31,11 @@ qpat compare SPY --cs 2026-02-20 --ce 2026-02-28 --hs 2020-02-20 --he 2020-02-28
 # Support & Resistance levels
 qpat sr NVDA --lookback 365
 
+# 3-Day Pin Fly recommendation (butterfly on the highest-OI pin strike)
+qpat fly SPY
+qpat fly SPY --min-rr 15 --account 25000
+qpat fly SPY --json | jq .legs
+
 # Interactive guided mode
 qpat interactive
 
@@ -76,6 +81,33 @@ qpat scan NVDA -d 20 -l 2000 -s 5 -n 10
 
 ### `qpat compare TICKER`
 Direct comparison of two date ranges. Useful for "does current behavior look like March 2020?"
+
+### `qpat fly TICKER`
+**3-Day Pin Fly** — recommends a short-dated (2-5 DTE) butterfly whose body
+sits on the highest open-interest "pin" strike near spot, targeting a
+structural risk:reward of at least 1:12 (ideal 1:15). Drift from 5/20 EMA
+alignment plus 3-session momentum picks the search band direction and the
+option right (put fly when bearish or pinned below spot, call fly otherwise).
+Strikes within 1.5% of spot are scored by gamma-weighted open interest with a
+bonus for round numbers; the expiry whose pin OI concentration is highest
+wins (a 2-DTE chain with a 22K wall beats a 5-DTE chain with 2K). Wing width
+adapts 5→3→2 until the mid debit fits the ceiling `width/(min_rr+1)` — if
+nothing fits, the verdict is NO TRADE. The ticket includes a suggested limit
+price; **fills above the ceiling void the trade**. CPI/PPI/FOMC/NFP prints
+inside the holding window trigger a warning and halve the sizing guidance
+(base: 0.5-1% of account per fly). Output is **analysis, not financial
+advice** — nothing is ever routed to a broker, and yfinance open interest is
+end-of-day stale, so verify the pin on your broker before entry.
+
+| Flag | Description |
+|------|-------------|
+| `-w` | Fixed wing width (disables the adaptive 5→3→2 ladder) |
+| `--min-rr` | Minimum structural risk:reward (default: 12) |
+| `--band` | Pin search band as % from spot (default: 1.5) |
+| `--min-dte` / `--max-dte` | Expiry window in days (default: 2-5) |
+| `--account` | Account size in dollars for sizing output |
+| `--expiry` | Explicit expiry (YYYY-MM-DD), overrides the DTE window |
+| `--json` | Emit machine-readable JSON instead of the Rich ticket |
 
 ### `qpat sr TICKER`
 Support & resistance detection using local extrema clustering. Shows touch count and strength.
