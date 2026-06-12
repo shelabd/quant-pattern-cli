@@ -130,7 +130,30 @@ qpat config set massive-api-key <YOUR_KEY>    # optional paid upgrade
 | `--account` | Account size in dollars for sizing output |
 | `--expiry` | Explicit expiry (YYYY-MM-DD), overrides the DTE window |
 | `--chain-source` | `auto` (default), `cboe`, `massive`, or `yfinance` |
+| `--log` | Append the recommendation to the forward-test journal |
 | `--json` | Emit machine-readable JSON instead of the Rich ticket |
+
+### `qpat journal`
+**Forward-test scorecard for `qpat fly`.** Historical option chains with
+open interest on 2-5 DTE expiries aren't available for free, so the fly
+engine is validated forward instead: `qpat fly TICKER --log` snapshots
+each recommendation (pin, OI, legs, debit) to `~/.qpat/fly_journal.jsonl`
+— same-day duplicates are skipped, so it's safe to run repeatedly — and
+`qpat journal` scores every entry whose expiry has passed against the
+realized expiry-day close. You get **pin accuracy** (median settle
+distance from the recommended pin, % within 0.5%) for all entries
+including NO TRADEs, and **trade stats** (in-tent hit rate, win rate,
+total P&L per fly at the mid debit, avg R multiple) for priced PASS
+entries. Settlement uses the expiry-day close — exact for PM-settled
+SPY/QQQ/equities, a proxy for AM-settled index options (SPX/RUT). Log
+daily for a few weeks and you have the track record no free data source
+can reconstruct.
+
+```bash
+qpat fly SPY --log        # log today's recommendation
+qpat journal              # score everything that has expired
+qpat journal -t SPY --json | jq .summary
+```
 
 ### `qpat sr TICKER`
 Support & resistance detection using local extrema clustering. Shows touch count and strength.
