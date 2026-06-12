@@ -183,7 +183,7 @@ def bs_gamma(spot: float, strike: float, iv: float, t_years: float) -> float:
 # ── Chain normalization ──────────────────────────────────────────────────────
 
 CHAIN_COLUMNS = [
-    "strike", "call_oi", "put_oi",
+    "strike", "call_oi", "put_oi", "call_vol", "put_vol",
     "call_bid", "call_ask", "call_last",
     "put_bid", "put_ask", "put_last", "iv",
 ]
@@ -192,14 +192,17 @@ CHAIN_COLUMNS = [
 def normalize_chain(calls: pd.DataFrame, puts: pd.DataFrame) -> pd.DataFrame:
     """Merge yfinance-style call/put frames into one frame per strike.
 
-    Expected input columns (per side): strike, openInterest, bid, ask,
-    lastPrice, impliedVolatility. Output columns: CHAIN_COLUMNS, with iv as
-    the mean of the usable per-side IVs (fallback DEFAULT_IV_FALLBACK).
+    Expected input columns (per side): strike, openInterest, volume, bid,
+    ask, lastPrice, impliedVolatility. Output columns: CHAIN_COLUMNS, with
+    iv as the mean of the usable per-side IVs (fallback DEFAULT_IV_FALLBACK).
+    Volume is carried because freshly listed weekly chains often report OI=0
+    until the overnight update — scoring falls back to volume then.
     """
     def side(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
         out = pd.DataFrame({
             "strike": df["strike"].astype(float),
             f"{prefix}_oi": df.get("openInterest", pd.Series(0, index=df.index)).fillna(0).astype(int),
+            f"{prefix}_vol": df.get("volume", pd.Series(0, index=df.index)).fillna(0).astype(int),
             f"{prefix}_bid": df.get("bid", pd.Series(0.0, index=df.index)).fillna(0.0),
             f"{prefix}_ask": df.get("ask", pd.Series(0.0, index=df.index)).fillna(0.0),
             f"{prefix}_last": df.get("lastPrice", pd.Series(0.0, index=df.index)).fillna(0.0),
@@ -209,7 +212,7 @@ def normalize_chain(calls: pd.DataFrame, puts: pd.DataFrame) -> pd.DataFrame:
 
     merged = side(calls, "call").merge(side(puts, "put"), on="strike", how="outer")
     for col in merged.columns:
-        if col.endswith("_oi"):
+        if col.endswith("_oi") or col.endswith("_vol"):
             merged[col] = merged[col].fillna(0).astype(int)
         elif col != "strike" and not col.endswith("_iv"):
             merged[col] = merged[col].fillna(0.0)
@@ -243,9 +246,14 @@ def score_pins(
     """Score every strike inside the drift band.
 
     Score = total OI (calls + puts) weighted by Black-Scholes gamma, with a
-    +10% bonus for strikes divisible by 5. Returns the band subset with
-    `total_oi`, `pin_score`, and `oi_rank` (1 = highest raw OI) columns,
-    sorted by pin_score descending. Empty frame when no strikes in band.
+    +10% bonus for strikes divisible by 5. When the entire band reports zero
+    OI (yfinance leaves freshly listed weeklies at 0 until the overnight
+    update) the score falls back to total volume as the concentration proxy;
+    `attrs["used_volume_fallback"]` is set on the result.
+
+    Returns the band subset with `total_oi`, `total_vol`, `pin_score`, and
+    `oi_rank` (1 = highest raw weight) columns, sorted by pin_score
+    descending. Empty frame when no strikes in band.
     """
     lo, hi = band_bounds(spot, band_pct, drift)
     band = chain[(chain["strike"] >= lo) & (chain["strike"] <= hi)].copy()
@@ -254,12 +262,22 @@ def score_pins(
 
     t_years = max(dte, 1) / 365.0
     band["total_oi"] = band["call_oi"] + band["put_oi"]
+    band["total_vol"] = (band["call_vol"] + band["put_vol"]
+                         if "call_vol" in band.columns else 0)
+
+    used_volume = bool(band["total_oi"].sum() == 0
+                       and "call_vol" in chain.columns
+                       and band["total_vol"].sum() > 0)
+    weight = band["total_vol"] if used_volume else band["total_oi"]
+
     band["gamma"] = band.apply(
         lambda r: bs_gamma(spot, r["strike"], r["iv"], t_years), axis=1)
     bonus = np.where(band["strike"] % 5 == 0, ROUND_NUMBER_BONUS, 1.0)
-    band["pin_score"] = band["total_oi"] * band["gamma"] * bonus
-    band["oi_rank"] = band["total_oi"].rank(ascending=False, method="min").astype(int)
-    return band.sort_values("pin_score", ascending=False).reset_index(drop=True)
+    band["pin_score"] = weight * band["gamma"] * bonus
+    band["oi_rank"] = weight.rank(ascending=False, method="min").astype(int)
+    band = band.sort_values("pin_score", ascending=False).reset_index(drop=True)
+    band.attrs["used_volume_fallback"] = used_volume
+    return band
 
 
 def select_pin(
@@ -271,17 +289,22 @@ def select_pin(
 ) -> Optional[dict]:
     """Top-scoring pin strike inside the band, or None when the band is empty.
 
-    Returns {strike, pin_score, total_oi, oi_rank}.
+    Returns {strike, pin_score, total_oi, concentration, oi_rank,
+    used_volume} where concentration is the weight that scored the pin (OI,
+    or volume under the zero-OI fallback).
     """
     scored = score_pins(chain, spot, dte, band_pct, drift)
     if scored.empty:
         return None
+    used_volume = bool(scored.attrs.get("used_volume_fallback", False))
     top = scored.iloc[0]
     return {
         "strike": float(top["strike"]),
         "pin_score": float(top["pin_score"]),
         "total_oi": int(top["total_oi"]),
+        "concentration": int(top["total_vol"] if used_volume else top["total_oi"]),
         "oi_rank": int(top["oi_rank"]),
+        "used_volume": used_volume,
     }
 
 
@@ -440,7 +463,7 @@ def choose_expiry(
         if best is None:
             best = entry
             continue
-        if (pin["total_oi"], -dte) > (best["pin"]["total_oi"], -best["dte"]):
+        if (pin["concentration"], -dte) > (best["pin"]["concentration"], -best["dte"]):
             best = entry
     return best
 
@@ -577,13 +600,22 @@ def recommend_fly(
     base.update(right=right, expiry=expiry, dte=dte, body_strike=body)
 
     # ── Adaptive width / pricing ──────────────────────────────────────
+    oi_warnings: list[str] = []
+    if pin["used_volume"]:
+        oi_warnings.append(
+            "Chain reports zero open interest across the band (yfinance OI "
+            "updates overnight) — pin scored by today's volume instead. "
+            "Verify the OI wall on your broker before trusting this pin."
+        )
+
     result = adaptive_width(chain, body, right, expiry, min_rr, fixed_width)
     if result["selected_width"] is None:
         rec = _no_trade(base, f"no wing width meets the 1:{min_rr:g} debit ceiling")
         rec.width_attempts = result["attempts"]
         rec.body_oi = pin["total_oi"]
         rec.band_rank = pin["oi_rank"]
-        rec.expiry_pin_oi = pin["total_oi"]
+        rec.expiry_pin_oi = pin["concentration"]
+        rec.warnings = oi_warnings
         return rec
 
     width, debit, legs = result["selected_width"], result["debit"], result["legs"]
@@ -597,6 +629,7 @@ def recommend_fly(
     in_window = [e for e in macro_events if today <= e.date <= expiry]
     coverage = max((e.date for e in macro_events), default=None)
     warnings, half_size = event_warnings(in_window, coverage, today, expiry)
+    warnings = oi_warnings + warnings
 
     sizing = (BASE_SIZING_PCT[0] / 2, BASE_SIZING_PCT[1] / 2) if half_size else BASE_SIZING_PCT
 
@@ -612,7 +645,7 @@ def recommend_fly(
         max_debit_ceiling=ceiling,
         body_oi=pin["total_oi"],
         band_rank=pin["oi_rank"],
-        expiry_pin_oi=pin["total_oi"],
+        expiry_pin_oi=pin["concentration"],
         verdict="PASS",
         warnings=warnings,
         width_attempts=result["attempts"],

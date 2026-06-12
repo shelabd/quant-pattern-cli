@@ -2047,6 +2047,87 @@ def dashboard(ticker, event_type, days, lookback, top_n, bins, regime, target_da
         )
 
 
+# ── FLY command ────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("ticker")
+@click.option("--width", "-w", type=float, default=None,
+              help="Fixed wing width (disables the adaptive 5→3→2 ladder)")
+@click.option("--min-rr", default=12.0, show_default=True,
+              help="Minimum structural risk:reward (sets the debit ceiling width/(rr+1))")
+@click.option("--band", default=1.5, show_default=True,
+              help="Pin search band as % from spot in the drift direction")
+@click.option("--min-dte", default=2, show_default=True, help="Minimum days to expiry")
+@click.option("--max-dte", default=5, show_default=True, help="Maximum days to expiry")
+@click.option("--account", type=float, default=None,
+              help="Account size in dollars (sizing shown in dollars as well as %)")
+@click.option("--expiry", "expiry_str", default=None,
+              help="Explicit expiry (YYYY-MM-DD), overrides DTE window")
+@click.option("--json", "as_json", is_flag=True,
+              help="Emit the recommendation as JSON (for piping)")
+@common_options
+def fly(ticker, width, min_rr, band, min_dte, max_dte, account, expiry_str,
+        as_json, provider, verbose):
+    """
+    Recommend a 3-Day Pin Fly: a 2-5 DTE butterfly bodied on the highest
+    open-interest pin strike near spot, targeting structural risk:reward
+    of at least 1:12.
+
+    Drift (5/20 EMA + 3-session momentum) picks the band direction and the
+    option right; the expiry with the heaviest pin OI wins; wing width
+    adapts 5→3→2 until the debit fits width/(min_rr+1). Skips or
+    half-sizes around CPI/PPI/FOMC/NFP prints inside the holding window.
+
+    Output is analysis, not financial advice — no orders are placed.
+
+    Examples:
+
+      qpat fly SPY
+
+      qpat fly SPY --min-rr 15 --account 25000
+
+      qpat fly QQQ -w 5 --expiry 2026-06-18
+
+      qpat fly SPY --json | jq .legs
+    """
+    from .butterfly import recommend_fly
+    from .display import display_fly
+
+    setup_logging(verbose)
+    ticker = ticker.upper()
+    expiry_override = (datetime.strptime(expiry_str, "%Y-%m-%d").date()
+                       if expiry_str else None)
+
+    if not as_json:
+        console.print(f"\n[bold cyan]⚡ 3-Day Pin Fly: {ticker}[/bold cyan]")
+        console.print(f"   Band: {band}% | DTE: {min_dte}-{max_dte} | Min R:R: 1:{min_rr:g}"
+                      + (f" | Width: {width:g} (fixed)" if width else " | Width: adaptive 5→3→2")
+                      + "\n")
+
+    try:
+        rec = recommend_fly(
+            ticker,
+            min_rr=min_rr,
+            band_pct=band,
+            min_dte=min_dte,
+            max_dte=max_dte,
+            fixed_width=width,
+            account=account,
+            expiry_override=expiry_override,
+        )
+    except Exception as e:
+        if as_json:
+            click.echo(json.dumps({"error": str(e)}))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    if as_json:
+        click.echo(json.dumps(rec.to_dict(), indent=2))
+    else:
+        display_fly(rec)
+
+
 # ── POTUS command ──────────────────────────────────────────────────────────────
 
 @cli.group()

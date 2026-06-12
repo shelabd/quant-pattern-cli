@@ -1199,3 +1199,99 @@ def display_regime_conditional_winrates(ticker: str, category: str, regime_winra
         )
 
     console.print(table)
+
+
+# ── Pin Butterfly Ticket ─────────────────────────────────────────────────────
+
+def display_fly(rec) -> None:
+    """Render a FlyRecommendation as an order ticket panel.
+
+    Header, BUY/SELL leg table, stats grid, PASS / NO TRADE verdict,
+    yellow warnings, and the stale-OI footnote.
+    """
+    drift_colors = {"bullish": "green", "bearish": "red", "neutral": "yellow"}
+    drift_color = drift_colors.get(rec.drift, "white")
+
+    # ── Header ──────────────────────────────────────────────────────────
+    header = Text()
+    header.append(f"{rec.ticker} ", style="bold cyan")
+    header.append(f"${rec.spot:.2f}", style="bold white")
+    header.append("  drift: ", style="dim")
+    header.append(rec.drift.upper(), style=f"bold {drift_color}")
+    if rec.right:
+        header.append(f"  {rec.right} FLY", style="bold white")
+    if rec.expiry:
+        header.append(f"  exp {rec.expiry} ({rec.dte} DTE)", style="white")
+    if rec.selected_width is not None:
+        width_note = "adaptive" if rec.width_was_adaptive else "fixed"
+        header.append(f"  width {rec.selected_width:g} ({width_note})", style="white")
+    console.print(Panel(header, title="[bold]3-Day Pin Fly[/bold]", border_style="cyan"))
+
+    # ── NO TRADE short-circuit ──────────────────────────────────────────
+    if rec.verdict != "PASS":
+        console.print(Text(f"\n  ✗ NO TRADE — {rec.no_trade_reason}", style="bold red"))
+        for attempt in rec.width_attempts:
+            console.print(Text(f"    width {attempt['width']:g}: {attempt['result']}", style="dim"))
+        for w in rec.warnings:
+            console.print(Text(f"  ⚠ {w}", style="yellow"))
+        console.print()
+        return
+
+    # ── Order ticket ────────────────────────────────────────────────────
+    ticket = Table(box=box.ROUNDED, header_style="bold cyan", title="Order Ticket")
+    ticket.add_column("Action", width=8)
+    ticket.add_column("Qty", justify="center", width=5)
+    ticket.add_column("Right", width=6)
+    ticket.add_column("Strike", justify="right", width=10)
+    ticket.add_column("Expiry", width=12)
+    ticket.add_column("Mid", justify="right", width=8)
+
+    for leg in rec.legs:
+        color = "green" if leg.action == "BUY" else "red"
+        ticket.add_row(
+            Text(leg.action, style=f"bold {color}"),
+            Text(str(leg.quantity), style=color),
+            leg.right,
+            f"{leg.strike:g}",
+            leg.expiry.isoformat(),
+            f"{leg.mid:.2f}",
+        )
+    console.print(ticket)
+
+    # ── Stats grid ──────────────────────────────────────────────────────
+    stats = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+    stats.add_column("Metric", style="dim", width=26)
+    stats.add_column("Value", width=30)
+
+    rr_color = "green" if rec.risk_reward >= rec.min_rr else "yellow"
+    stats.add_row("Debit (per fly)", Text(f"${rec.debit * 100:.2f}", style="bold white"))
+    stats.add_row("Max payout (per fly)", Text(f"${rec.max_profit * 100:.2f}", style="bold green"))
+    stats.add_row("Risk : Reward", Text(f"1 : {rec.risk_reward:.1f}", style=f"bold {rr_color}"))
+    stats.add_row("Breakevens", f"{rec.breakeven_low:.2f} / {rec.breakeven_high:.2f}")
+    stats.add_row("Body OI / band rank", f"{rec.body_oi:,} / #{rec.band_rank}")
+    stats.add_row("Suggested limit", Text(
+        f"${rec.limit_price:.2f} per share (${rec.limit_price * 100:.2f} per fly)",
+        style="bold cyan"))
+    stats.add_row("Debit ceiling", Text(
+        f"${rec.max_debit_ceiling:.2f} — fills above this VOID the trade",
+        style="bold red"))
+    console.print(stats)
+
+    # ── Sizing + verdict ────────────────────────────────────────────────
+    lo, hi = rec.sizing_pct
+    if rec.account_size:
+        per_fly_lo = rec.account_size * lo / 100
+        per_fly_hi = rec.account_size * hi / 100
+        sizing_text = (f"Size: {lo:g}-{hi:g}% of account "
+                       f"(${per_fly_lo:,.0f}-${per_fly_hi:,.0f} on ${rec.account_size:,.0f})")
+    else:
+        sizing_text = f"Size: {lo:g}-{hi:g}% of account per fly"
+    console.print(Text(f"  {sizing_text}", style="white"))
+
+    console.print(Text(f"\n  ✓ PASS — structural 1:{rec.risk_reward:.1f} at the mid", style="bold green"))
+    for w in rec.warnings:
+        console.print(Text(f"  ⚠ {w}", style="yellow"))
+
+    console.print(Text("\n  OI as of last close; verify on your broker before entry. "
+                       "Analysis only — not financial advice.", style="dim"))
+    console.print()
