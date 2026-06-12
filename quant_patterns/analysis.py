@@ -499,7 +499,20 @@ def compute_signal_stats(
     Single source of truth for direction/confidence — replaces the raw
     win-rate-as-confidence logic previously duplicated across modules.
     """
-    rets = profile.returns_after_list
+    return signal_stats_from_returns(profile.returns_after_list, baseline)
+
+
+def signal_stats_from_returns(
+    returns: list[float],
+    baseline: Optional[BaselineStats] = None,
+) -> SignalStats:
+    """SignalStats from a raw list of post-event returns (%).
+
+    Same machinery as compute_signal_stats without requiring a full
+    PatternProfile — used by the walk-forward backtester, which rebuilds
+    the signal from only the events known at each as-of date.
+    """
+    rets = returns
     n = len(rets)
     wins = sum(1 for r in rets if r > 0)
     win_rate = wins / n if n else 0.0
