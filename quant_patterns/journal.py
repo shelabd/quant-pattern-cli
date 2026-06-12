@@ -1,0 +1,164 @@
+"""
+Forward-test journal for pin-fly recommendations.
+
+Historical chains with OI on 2-5 DTE expiries don't exist for free, so the
+fly engine is validated forward instead: `qpat fly --log` appends each
+recommendation (pin, OI, legs, debit — the full to_dict snapshot) to
+~/.qpat/fly_journal.jsonl, and `qpat journal` scores expired entries
+against the realized close on expiry day. Over time this accumulates the
+two numbers no vendor sells: how often price actually settles at the
+recommended pin, and the P&L of the recommended structure.
+
+Pure logic except the jsonl read/append helpers; settle prices are
+injected as a callable so scoring is offline-testable. Settlement uses the
+expiry-day close — a proxy that is exact for PM-settled contracts
+(SPY/QQQ/equities) but not for AM-settled index options (SPX/RUT).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from datetime import date, datetime
+from statistics import mean, median
+from typing import Callable, Optional
+
+from .macro_calendar import QPAT_DIR
+
+logger = logging.getLogger(__name__)
+
+JOURNAL_PATH = QPAT_DIR / "fly_journal.jsonl"
+
+
+# ── IO ───────────────────────────────────────────────────────────────────────
+
+def load_journal(path=None) -> list[dict]:
+    """Read all journal entries, skipping corrupt lines."""
+    path = path or JOURNAL_PATH
+    if not path.exists():
+        return []
+    entries = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            logger.warning(f"Skipping corrupt journal line: {line[:80]}")
+    return entries
+
+
+def log_recommendation(rec, as_of: Optional[date] = None, path=None) -> tuple[Optional[dict], bool]:
+    """Append a FlyRecommendation to the journal.
+
+    Returns (entry, appended). entry is None when the rec has no pin to
+    score (no expiry/body — nothing to forward-test). appended is False
+    when an identical pin (same ticker/as-of/expiry/body) is already
+    logged, so a second run on the same day doesn't double-count.
+    """
+    if rec.expiry is None or rec.body_strike is None:
+        return None, False
+
+    as_of = as_of or date.today()
+    path = path or JOURNAL_PATH
+    entry = {
+        "as_of": as_of.isoformat(),
+        "logged_at": datetime.now().isoformat(timespec="seconds"),
+        **rec.to_dict(),
+    }
+
+    for existing in load_journal(path):
+        if (existing.get("ticker") == entry["ticker"]
+                and existing.get("as_of") == entry["as_of"]
+                and existing.get("expiry") == entry["expiry"]
+                and existing.get("body_strike") == entry["body_strike"]):
+            return existing, False
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
+    return entry, True
+
+
+# ── Scoring (pure) ───────────────────────────────────────────────────────────
+
+def score_entry(entry: dict, settle: float) -> dict:
+    """Score one journal entry against the realized settle price.
+
+    Always scores pin accuracy (settle distance from the body). When the
+    entry was a priced trade (width + debit present), also scores the fly:
+    payoff = max(0, width - |settle - body|), pnl = payoff - debit.
+    """
+    body = entry["body_strike"]
+    spot = entry.get("spot")
+    out = dict(entry)
+    out["settle"] = settle
+    out["pin_dist"] = round(settle - body, 4)
+    out["pin_dist_pct"] = round((settle - body) / spot * 100, 4) if spot else None
+
+    width = entry.get("selected_width")
+    debit = entry.get("debit_per_share")
+    if width and debit:
+        payoff = max(0.0, width - abs(settle - body))
+        out["payoff_per_share"] = round(payoff, 4)
+        out["pnl_per_share"] = round(payoff - debit, 4)
+        out["pnl_per_fly"] = round((payoff - debit) * 100, 2)
+        out["r_multiple"] = round((payoff - debit) / debit, 2)
+        out["in_tent"] = abs(settle - body) < width
+        out["win"] = payoff - debit > 0
+    return out
+
+
+def score_journal(
+    entries: list[dict],
+    get_close: Callable[[str, date], Optional[float]],
+    today: Optional[date] = None,
+) -> tuple[list[dict], list[dict]]:
+    """Split entries into (scored, pending).
+
+    Entries whose expiry is before today are scored against
+    get_close(ticker, expiry); a missing close (data gap) leaves the entry
+    pending rather than guessing.
+    """
+    today = today or date.today()
+    scored, pending = [], []
+    for entry in entries:
+        expiry = date.fromisoformat(entry["expiry"])
+        if expiry >= today:
+            pending.append(entry)
+            continue
+        settle = get_close(entry["ticker"], expiry)
+        if settle is None:
+            logger.warning(f"No close for {entry['ticker']} on {expiry}; leaving pending")
+            pending.append(entry)
+            continue
+        scored.append(score_entry(entry, settle))
+    return scored, pending
+
+
+def summarize(scored: list[dict]) -> dict:
+    """Aggregate forward-test stats across scored entries.
+
+    Pin accuracy uses every scored entry (NO TRADE pins still test the
+    pin hypothesis); trade stats use only priced PASS entries.
+    """
+    pin_pcts = [abs(e["pin_dist_pct"]) for e in scored if e.get("pin_dist_pct") is not None]
+    trades = [e for e in scored if e.get("win") is not None]
+
+    out = {
+        "n_scored": len(scored),
+        "n_trades": len(trades),
+        "median_abs_pin_dist_pct": round(median(pin_pcts), 3) if pin_pcts else None,
+        "pin_within_half_pct": round(mean(abs(p) <= 0.5 for p in pin_pcts), 3) if pin_pcts else None,
+    }
+    if trades:
+        out.update({
+            "hit_rate": round(mean(e["in_tent"] for e in trades), 3),
+            "win_rate": round(mean(e["win"] for e in trades), 3),
+            "total_pnl_per_fly": round(sum(e["pnl_per_fly"] for e in trades), 2),
+            "avg_r_multiple": round(mean(e["r_multiple"] for e in trades), 2),
+            "best_r": max(e["r_multiple"] for e in trades),
+            "worst_r": min(e["r_multiple"] for e in trades),
+        })
+    return out

@@ -2068,11 +2068,14 @@ def dashboard(ticker, event_type, days, lookback, top_n, bins, regime, target_da
               help="Options chain source (auto = Massive when an API key is "
                    "configured via `qpat config set massive-api-key`, else "
                    "CBOE's free delayed feed; yfinance is the failure fallback)")
+@click.option("--log", "log_entry", is_flag=True,
+              help="Append the recommendation to the forward-test journal "
+                   "(~/.qpat/fly_journal.jsonl); score later with `qpat journal`")
 @click.option("--json", "as_json", is_flag=True,
               help="Emit the recommendation as JSON (for piping)")
 @common_options
 def fly(ticker, width, min_rr, band, min_dte, max_dte, account, expiry_str,
-        chain_source, as_json, provider, verbose):
+        chain_source, log_entry, as_json, provider, verbose):
     """
     Recommend a 3-Day Pin Fly: a 2-5 DTE butterfly bodied on the highest
     open-interest pin strike near spot, targeting structural risk:reward
@@ -2132,6 +2135,71 @@ def fly(ticker, width, min_rr, band, min_dte, max_dte, account, expiry_str,
         click.echo(json.dumps(rec.to_dict(), indent=2))
     else:
         display_fly(rec)
+
+    if log_entry:
+        from .journal import log_recommendation, JOURNAL_PATH
+
+        entry, appended = log_recommendation(rec)
+        if entry is None:
+            msg = "Not journaled — no pin/expiry in this recommendation."
+        elif appended:
+            msg = f"Journaled to {JOURNAL_PATH} — score after expiry with: qpat journal"
+        else:
+            msg = "Already journaled today (same ticker/expiry/pin) — skipped."
+        if as_json:
+            click.echo(msg, err=True)
+        else:
+            console.print(f"  [dim]{msg}[/dim]\n")
+
+
+# ── JOURNAL command ─────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--ticker", "-t", default=None, help="Only show entries for this ticker")
+@click.option("--json", "as_json", is_flag=True, help="Emit scored journal as JSON")
+@common_options
+def journal(ticker, as_json, provider, verbose):
+    """
+    Score the pin-fly forward-test journal.
+
+    Entries logged with `qpat fly --log` are scored once their expiry has
+    passed: settle distance from the recommended pin for every entry, and
+    fly P&L at the mid debit for priced PASS entries. Settlement uses the
+    expiry-day close (exact for PM-settled SPY/QQQ/equities; AM-settled
+    index options like SPX differ).
+    """
+    from .journal import load_journal, score_journal, summarize
+    from .display import display_journal
+
+    setup_logging(verbose)
+    entries = load_journal()
+    if ticker:
+        entries = [e for e in entries if e.get("ticker") == ticker.upper()]
+    if not entries:
+        console.print("[yellow]Journal is empty — log recommendations with: qpat fly TICKER --log[/yellow]")
+        return
+
+    dp = get_provider("yfinance")
+
+    def get_close(tkr: str, day: date) -> Optional[float]:
+        for symbol in (tkr, f"^{tkr}"):
+            try:
+                df = dp.get_daily_ohlcv(symbol, day - timedelta(days=7), day)
+            except ValueError:
+                continue
+            if df.index[-1].date() == day:
+                return float(df["Close"].iloc[-1])
+            return None
+        return None
+
+    scored, pending = score_journal(entries, get_close)
+    stats = summarize(scored)
+
+    if as_json:
+        click.echo(json.dumps(
+            {"summary": stats, "scored": scored, "pending": pending}, indent=2))
+    else:
+        display_journal(scored, pending, stats)
 
 
 # ── BACKTEST command ────────────────────────────────────────────────────────────

@@ -1298,6 +1298,67 @@ def display_fly(rec) -> None:
     console.print()
 
 
+# ── Fly Forward-Test Journal ─────────────────────────────────────────────────
+
+def display_journal(scored: list, pending: list, stats: dict) -> None:
+    """Render the scored fly journal: summary panel, scored entries table,
+    and pending entries awaiting expiry."""
+    console.print(Rule("[bold cyan]Pin Fly Forward-Test Journal"))
+
+    if stats["n_scored"]:
+        text = Text()
+        text.append(f"Scored: {stats['n_scored']}", style="bold white")
+        text.append(f"  (trades: {stats['n_trades']})\n", style="dim")
+        if stats.get("median_abs_pin_dist_pct") is not None:
+            text.append("Pin accuracy — median settle distance: ", style="white")
+            text.append(f"{stats['median_abs_pin_dist_pct']:.2f}%", style="bold cyan")
+            text.append(f"  |  within 0.5% of pin: {stats['pin_within_half_pct']:.0%}\n", style="white")
+        if stats["n_trades"]:
+            pnl = stats["total_pnl_per_fly"]
+            pnl_style = "bold green" if pnl >= 0 else "bold red"
+            text.append(f"Hit rate (in tent): {stats['hit_rate']:.0%}", style="white")
+            text.append(f"  |  win rate: {stats['win_rate']:.0%}\n", style="white")
+            text.append("Total P&L per fly: ", style="white")
+            text.append(f"${pnl:+,.2f}", style=pnl_style)
+            text.append(f"  |  avg R: {stats['avg_r_multiple']:+.2f} "
+                        f"(best {stats['best_r']:+.2f} / worst {stats['worst_r']:+.2f})", style="dim")
+        console.print(Panel(text, border_style="cyan"))
+
+        table = Table(box=box.ROUNDED, header_style="bold cyan", title="Scored")
+        for col, justify in [("As-of", "left"), ("Ticker", "left"), ("Expiry", "left"),
+                             ("Pin", "right"), ("W", "right"), ("Debit", "right"),
+                             ("Settle", "right"), ("Dist %", "right"), ("P&L/fly", "right")]:
+            table.add_column(col, justify=justify, no_wrap=True)
+        for e in scored:
+            pnl = e.get("pnl_per_fly")
+            dist = e.get("pin_dist_pct")
+            table.add_row(
+                e.get("as_of", "?"), e["ticker"], e["expiry"],
+                f"{e['body_strike']:g}",
+                f"{e['selected_width']:g}" if e.get("selected_width") else "—",
+                f"{e['debit_per_share']:.2f}" if e.get("debit_per_share") else "—",
+                f"{e['settle']:.2f}",
+                Text(f"{dist:+.2f}%", style="green" if abs(dist) <= 0.5 else "yellow")
+                if dist is not None else "—",
+                Text(f"${pnl:+,.2f}", style="green" if pnl > 0 else "red")
+                if pnl is not None else Text("no trade", style="dim"),
+            )
+        console.print(table)
+    else:
+        console.print(Text("\n  No expired entries to score yet.", style="yellow"))
+
+    if pending:
+        console.print(Text(f"\n  Pending ({len(pending)} awaiting expiry):", style="bold white"))
+        for e in pending:
+            console.print(Text(
+                f"    {e.get('as_of', '?')}  {e['ticker']}  exp {e['expiry']}  "
+                f"pin {e['body_strike']:g}  {e.get('verdict', '?')}", style="dim"))
+
+    console.print(Text("\n  Settle = expiry-day close (PM-settled proxy). "
+                       "Analysis only — not financial advice.", style="dim"))
+    console.print()
+
+
 # ── Walk-Forward Backtest ────────────────────────────────────────────────────
 
 def display_backtest(reports: list, ticker: str) -> None:
