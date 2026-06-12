@@ -366,3 +366,258 @@ def evaluate_ratio(debit: float, width: float, body: float) -> dict:
 def floor_to_cent(value: float) -> float:
     """Floor to $0.01 so a rounded limit price can never exceed the ceiling."""
     return math.floor(value * 100 + 1e-9) / 100
+
+
+# ── Adaptive wing width ──────────────────────────────────────────────────────
+
+def adaptive_width(
+    chain: pd.DataFrame,
+    body: float,
+    right: str,
+    expiry: date,
+    min_rr: float = DEFAULT_MIN_RR,
+    fixed_width: Optional[float] = None,
+) -> dict:
+    """Walk the width ladder (5 → 3 → 2) until the mid debit fits the ceiling.
+
+    A fixed_width disables the ladder and tries only that width. Returns
+    {selected_width, debit, legs, attempts, adaptive} with selected_width
+    None when nothing passes; attempts records why each width failed.
+    """
+    widths = (fixed_width,) if fixed_width is not None else WIDTH_LADDER
+    attempts: list[dict] = []
+
+    for width in widths:
+        if width < MIN_WIDTH and fixed_width is None:
+            continue
+        ceiling = max_debit_for(width, min_rr)
+        try:
+            debit, legs = price_fly(chain, body, width, right, expiry)
+        except UnpriceableStrikeError as e:
+            attempts.append({"width": width, "result": f"unpriceable: {e}"})
+            continue
+        if debit <= 0:
+            attempts.append({"width": width, "result": f"non-positive mid debit {debit:.2f} (stale quotes)"})
+            continue
+        if debit <= ceiling:
+            attempts.append({"width": width, "result": f"debit {debit:.2f} <= ceiling {ceiling:.2f} — selected"})
+            return {
+                "selected_width": width,
+                "debit": debit,
+                "legs": legs,
+                "attempts": attempts,
+                "adaptive": fixed_width is None,
+            }
+        attempts.append({"width": width, "result": f"debit {debit:.2f} > ceiling {ceiling:.2f}"})
+
+    return {"selected_width": None, "debit": None, "legs": [],
+            "attempts": attempts, "adaptive": fixed_width is None}
+
+
+# ── OI-aware expiry selection ────────────────────────────────────────────────
+
+def choose_expiry(
+    candidates: list[tuple[date, pd.DataFrame]],
+    spot: float,
+    today: date,
+    band_pct: float = DEFAULT_BAND_PCT,
+    drift: str = "neutral",
+) -> Optional[dict]:
+    """Pick the expiry whose best pin strike carries the most open interest.
+
+    The pin only exists where the OI lives: a 2-DTE chain with a
+    22K-contract wall beats a 5-DTE chain with 2K. Ties break toward
+    shorter DTE. Returns {expiry, dte, chain, pin} or None when no
+    candidate has a strike in band.
+    """
+    best: Optional[dict] = None
+    for expiry, chain in candidates:
+        dte = (expiry - today).days
+        pin = select_pin(chain, spot, dte, band_pct, drift)
+        if pin is None:
+            continue
+        entry = {"expiry": expiry, "dte": dte, "chain": chain, "pin": pin}
+        if best is None:
+            best = entry
+            continue
+        if (pin["total_oi"], -dte) > (best["pin"]["total_oi"], -best["dte"]):
+            best = entry
+    return best
+
+
+# ── Event skip rule ──────────────────────────────────────────────────────────
+
+MACRO_EVENT_CATEGORIES = ("cpi", "ppi", "fomc", "nfp")
+
+
+def event_warnings(
+    events_in_window: list,
+    calendar_coverage: Optional[date],
+    today: date,
+    expiry: date,
+) -> tuple[list[str], bool]:
+    """Event-skip warnings for the holding window [today, expiry].
+
+    events_in_window: MarketEvent-like objects (need .name and .date) dated
+    inside the window. calendar_coverage: the latest macro event date known
+    to the calendar — when it doesn't reach the expiry we can't rule events
+    out, so degrade with an "incomplete" notice instead of silence.
+
+    Returns (warnings, half_size) where half_size is True when an actual
+    event sits inside the window.
+    """
+    warnings: list[str] = []
+    half_size = False
+
+    for evt in sorted(events_in_window, key=lambda e: e.date):
+        if today <= evt.date <= expiry:
+            warnings.append(
+                f"{evt.name} on {evt.date} falls inside the holding window — "
+                "enter after the print or skip; half size at most."
+            )
+            half_size = True
+
+    if calendar_coverage is None or calendar_coverage < expiry:
+        warnings.append(
+            "Event calendar incomplete for this window — verify CPI/PPI/FOMC/NFP "
+            "dates manually (run: qpat events sync-calendar)."
+        )
+
+    return warnings, half_size
+
+
+# ── Orchestrator (network lives here only) ───────────────────────────────────
+
+def _no_trade(rec_kwargs: dict, reason: str) -> "FlyRecommendation":
+    rec = FlyRecommendation(**rec_kwargs)
+    rec.verdict = "NO TRADE"
+    rec.no_trade_reason = reason
+    return rec
+
+
+def recommend_fly(
+    ticker: str,
+    min_rr: float = DEFAULT_MIN_RR,
+    band_pct: float = DEFAULT_BAND_PCT,
+    min_dte: int = DEFAULT_MIN_DTE,
+    max_dte: int = DEFAULT_MAX_DTE,
+    fixed_width: Optional[float] = None,
+    account: Optional[float] = None,
+    expiry_override: Optional[date] = None,
+    today: Optional[date] = None,
+) -> FlyRecommendation:
+    """End-to-end pin-fly recommendation against live yfinance data.
+
+    The only function in this module that touches the network. OHLCV (for
+    drift and spot) goes through data.py's provider; option chains use
+    yfinance directly.
+    TODO: extend the DataProvider ABC with an options-chain method so IBKR
+    can serve fresher OI than yfinance's end-of-day snapshot.
+    """
+    import yfinance as yf
+    from datetime import timedelta
+    from .data import get_provider
+    from .events import EventCatalog, EventCategory
+
+    ticker = ticker.upper()
+    today = today or date.today()
+
+    # ── Spot + drift from provider OHLCV ──────────────────────────────
+    provider = get_provider("yfinance")
+    history = provider.get_daily_ohlcv(ticker, today - timedelta(days=90), today)
+    close = history["Close"]
+    spot = float(close.iloc[-1])
+    drift = detect_drift(close)
+
+    base = dict(
+        ticker=ticker, spot=spot, drift=drift, right="",
+        expiry=None, dte=None, body_strike=None,
+        selected_width=None, width_was_adaptive=fixed_width is None,
+        account_size=account, min_rr=min_rr,
+    )
+
+    # ── Candidate expiries ────────────────────────────────────────────
+    tk = yf.Ticker(ticker)
+    all_expiries = [date.fromisoformat(e) for e in (tk.options or ())]
+    if expiry_override is not None:
+        candidates_dates = [e for e in all_expiries if e == expiry_override]
+        if not candidates_dates:
+            return _no_trade(base, f"expiry {expiry_override} not listed for {ticker}")
+    else:
+        candidates_dates = [e for e in all_expiries
+                            if min_dte <= (e - today).days <= max_dte]
+        if not candidates_dates:
+            return _no_trade(base, f"no listed expiries within {min_dte}-{max_dte} DTE")
+
+    candidates: list[tuple[date, pd.DataFrame]] = []
+    for exp in candidates_dates:
+        try:
+            oc = tk.option_chain(exp.isoformat())
+            candidates.append((exp, normalize_chain(oc.calls, oc.puts)))
+        except Exception as e:
+            logger.warning(f"Could not load chain for {exp}: {e}")
+    if not candidates:
+        return _no_trade(base, "no option chains could be loaded")
+
+    # ── OI-aware expiry + pin selection ───────────────────────────────
+    choice = choose_expiry(candidates, spot, today, band_pct, drift)
+    if choice is None:
+        return _no_trade(base, f"no strikes inside the {band_pct}% {drift} band on any candidate expiry")
+
+    expiry, dte, chain, pin = choice["expiry"], choice["dte"], choice["chain"], choice["pin"]
+    body = pin["strike"]
+
+    # Drift decides the right: put fly when bearish, or neutral with the pin
+    # at/below spot; call fly otherwise.
+    if drift == "bearish" or (drift == "neutral" and body <= spot):
+        right = "PUT"
+    else:
+        right = "CALL"
+
+    base.update(right=right, expiry=expiry, dte=dte, body_strike=body)
+
+    # ── Adaptive width / pricing ──────────────────────────────────────
+    result = adaptive_width(chain, body, right, expiry, min_rr, fixed_width)
+    if result["selected_width"] is None:
+        rec = _no_trade(base, f"no wing width meets the 1:{min_rr:g} debit ceiling")
+        rec.width_attempts = result["attempts"]
+        rec.body_oi = pin["total_oi"]
+        rec.band_rank = pin["oi_rank"]
+        rec.expiry_pin_oi = pin["total_oi"]
+        return rec
+
+    width, debit, legs = result["selected_width"], result["debit"], result["legs"]
+    ceiling = max_debit_for(width, min_rr)
+    ratio = evaluate_ratio(debit, width, body)
+
+    # ── Event skip rule ───────────────────────────────────────────────
+    catalog = EventCatalog()
+    macro_events = [e for e in catalog.events
+                    if e.category.value in MACRO_EVENT_CATEGORIES]
+    in_window = [e for e in macro_events if today <= e.date <= expiry]
+    coverage = max((e.date for e in macro_events), default=None)
+    warnings, half_size = event_warnings(in_window, coverage, today, expiry)
+
+    sizing = (BASE_SIZING_PCT[0] / 2, BASE_SIZING_PCT[1] / 2) if half_size else BASE_SIZING_PCT
+
+    rec = FlyRecommendation(
+        **base,
+        legs=legs,
+        debit=debit,
+        max_profit=ratio["max_profit"],
+        risk_reward=ratio["risk_reward"],
+        breakeven_low=ratio["breakeven_low"],
+        breakeven_high=ratio["breakeven_high"],
+        limit_price=floor_to_cent(min(debit, ceiling)),
+        max_debit_ceiling=ceiling,
+        body_oi=pin["total_oi"],
+        band_rank=pin["oi_rank"],
+        expiry_pin_oi=pin["total_oi"],
+        verdict="PASS",
+        warnings=warnings,
+        width_attempts=result["attempts"],
+        sizing_pct=sizing,
+    )
+    rec.selected_width = width
+    rec.width_was_adaptive = result["adaptive"]
+    return rec
