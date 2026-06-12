@@ -1295,3 +1295,78 @@ def display_fly(rec) -> None:
     console.print(Text("\n  OI as of last close; verify on your broker before entry. "
                        "Analysis only — not financial advice.", style="dim"))
     console.print()
+
+
+# ── Walk-Forward Backtest ────────────────────────────────────────────────────
+
+def display_backtest(reports: list, ticker: str) -> None:
+    """Render walk-forward backtest scorecards.
+
+    One panel per signal type: hit rate vs the majority baseline, p-value
+    verdict, directional breakdown, and the confidence calibration table.
+    """
+    console.print(Rule(f"[bold cyan]Walk-Forward Backtest: {ticker}"))
+
+    for report in reports:
+        console.print()
+        title = f"[bold]{report.signal_type}[/bold] — {report.horizon_days}d horizon"
+
+        if report.n_signals == 0:
+            console.print(Panel(
+                Text("No walk-forward signals could be generated.", style="yellow"),
+                title=title, border_style="yellow"))
+            for note in report.notes:
+                console.print(Text(f"  {note}", style="dim"))
+            continue
+
+        stats = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+        stats.add_column("Metric", style="dim", width=30)
+        stats.add_column("Value", width=40)
+
+        beat = report.hit_rate > report.majority_baseline
+        hit_color = "green" if beat else "red"
+        stats.add_row("Signals scored", str(report.n_signals))
+        stats.add_row("Hit rate (direction correct)",
+                      Text(f"{report.hit_rate:.1%}", style=f"bold {hit_color}"))
+        stats.add_row("Majority baseline (bar to beat)",
+                      f"{report.majority_baseline:.1%} "
+                      f"(market up {report.up_rate:.0%} of windows)")
+        p_color = "green" if report.predictive else "yellow"
+        stats.add_row("p-value vs baseline",
+                      Text(f"{report.p_value:.3f}", style=f"bold {p_color}"))
+        ret_color = "green" if report.avg_signal_return_pct > 0 else "red"
+        stats.add_row("Avg return in signal direction",
+                      Text(f"{report.avg_signal_return_pct:+.3f}% per signal",
+                           style=ret_color))
+        stats.add_row("Bullish calls",
+                      f"{report.n_bullish} (hit {report.avg_bullish_hit_rate:.0%})")
+        stats.add_row("Bearish calls",
+                      f"{report.n_bearish} (hit {report.avg_bearish_hit_rate:.0%})")
+
+        verdict_color = "green" if report.predictive else "yellow"
+        console.print(Panel(
+            stats, title=title, border_style=verdict_color))
+        console.print(Text(f"  Verdict: {report.verdict}",
+                           style=f"bold {verdict_color}"))
+
+        if report.calibration:
+            cal = Table(box=box.ROUNDED, header_style="bold cyan",
+                        title="Calibration — does confidence mean anything?")
+            cal.add_column("Confidence", width=14)
+            cal.add_column("Signals", justify="right", width=9)
+            cal.add_column("Hit rate", justify="right", width=10)
+            for b in report.calibration:
+                bar_color = "green" if b.hit_rate >= report.majority_baseline else "red"
+                cal.add_row(f"{b.lo:.1f} – {b.hi:.1f}", str(b.n),
+                            Text(f"{b.hit_rate:.0%}", style=bar_color))
+            console.print(cal)
+
+        for note in report.notes:
+            console.print(Text(f"  ⚠ {note}", style="yellow") if "optimistic" in note
+                          else Text(f"  {note}", style="dim"))
+
+    console.print(Text(
+        "\n  Walk-forward: every signal was built from data available at its "
+        "as-of date only.\n  Past performance does not guarantee future "
+        "results — analysis, not financial advice.", style="dim"))
+    console.print()

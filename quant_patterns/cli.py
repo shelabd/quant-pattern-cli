@@ -2128,6 +2128,90 @@ def fly(ticker, width, min_rr, band, min_dte, max_dte, account, expiry_str,
         display_fly(rec)
 
 
+# ── BACKTEST command ────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("ticker")
+@click.option("--event-type", "-e", default="all",
+              type=click.Choice(["all", "cpi", "ppi", "fomc", "nfp", "earnings",
+                                 "election", "geopolitical", "gdp", "retail_sales",
+                                 "opec", "crypto", "potus"]),
+              help="Event category for the event leg ('all' pools cpi/ppi/fomc/nfp)")
+@click.option("--horizon", default=10, show_default=True,
+              help="Trading days each signal is scored over")
+@click.option("--mode", type=click.Choice(["both", "events", "scan"]),
+              default="both", show_default=True, help="Which signal types to replay")
+@click.option("--window", default=10, show_default=True,
+              help="Scan pattern window in trading days")
+@click.option("--step", default=None, type=int,
+              help="Trading days between scan as-of dates (default: horizon, "
+                   "so scoring windows never overlap)")
+@click.option("--lookback", default=2000, show_default=True,
+              help="Calendar days of history for the scan leg")
+@click.option("--min-history", default=5, show_default=True,
+              help="Prior events required before the event signal is scored")
+@click.option("--export-json", "-o", default=None, help="Export full results to JSON")
+@common_options
+def backtest(ticker, event_type, horizon, mode, window, step, lookback,
+             min_history, export_json, provider, verbose):
+    """
+    Walk-forward backtest of qpat's directional signals.
+
+    Replays history: at each as-of date the signal is rebuilt from only the
+    data available then, and its direction is scored against the realized
+    next-N-day return. The hit rate is tested against the majority-class
+    baseline (in a market that rose 63% of windows, "always bullish"
+    already hits 63% — the signal must beat that).
+
+    This is the command that answers "how much should I trust qpat?" —
+    believe its p-values over any single signal's confidence.
+
+    Examples:
+
+      qpat backtest SPY
+
+      qpat backtest SPY -e fomc --horizon 5
+
+      qpat backtest NVDA --mode scan --lookback 3000 -o bt.json
+    """
+    from .backtest import run_backtest
+    from .display import display_backtest
+
+    setup_logging(verbose)
+    ticker = ticker.upper()
+
+    if event_type == "all":
+        categories = [EventCategory.CPI, EventCategory.PPI,
+                      EventCategory.FOMC, EventCategory.NFP]
+    else:
+        categories = [EventCategory(event_type)]
+
+    cat_label = "+".join(c.value for c in categories)
+    console.print(f"\n[bold cyan]⚡ Walk-forward backtest: {ticker}[/bold cyan]")
+    console.print(f"   Events: {cat_label} | Horizon: {horizon}d | Mode: {mode}\n")
+
+    with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}")) as progress:
+        task = progress.add_task("Backtesting...", total=None)
+        reports = run_backtest(
+            ticker,
+            categories=categories,
+            horizon=horizon,
+            mode=mode,
+            window_size=window,
+            step=step,
+            lookback_days=lookback,
+            min_history=min_history,
+            progress_cb=lambda msg: progress.update(task, description=f"Backtesting: {msg}"),
+        )
+
+    display_backtest(reports, ticker)
+
+    if export_json:
+        path = Path(export_json)
+        path.write_text(json.dumps([r.to_dict() for r in reports], indent=2, default=str))
+        console.print(f"[green]✓ Exported to {path}[/green]")
+
+
 # ── POTUS command ──────────────────────────────────────────────────────────────
 
 @cli.group()
