@@ -3,7 +3,7 @@ Pin butterfly recommendation engine — the "3-Day Pin Fly" strategy.
 
 A short-dated (2-5 DTE) butterfly whose body sits on the highest
 open-interest "pin" strike near spot, targeting a structural risk:reward of
-at least 1:12 (ideal 1:15). The engine detects price drift, scores strikes
+at least 1:5 (ideal 1:15). The engine detects price drift, scores strikes
 inside a directional band by gamma-weighted open interest, selects the
 expiry whose pin OI concentration is highest, and walks an adaptive wing
 width (5 → 3 → 2) until the debit fits the ceiling `width / (min_rr + 1)`.
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-DEFAULT_MIN_RR = 12.0
+DEFAULT_MIN_RR = 5.0
 IDEAL_RR = 15.0
 WIDTH_LADDER: tuple[float, ...] = (5.0, 3.0, 2.0)
 MIN_WIDTH = 2.0
