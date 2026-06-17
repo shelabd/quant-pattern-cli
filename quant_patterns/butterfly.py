@@ -8,6 +8,13 @@ inside a directional band by gamma-weighted open interest, selects the
 expiry whose pin OI concentration is highest, and walks an adaptive wing
 width (5 → 3 → 2) until the debit fits the ceiling `width / (min_rr + 1)`.
 
+On top of that structural pick it overlays an *informational* expected-move
+model (IV-implied diffusion ⊕ a macro-event vol bump for FOMC/CPI/PPI/NFP
+landing in the holding window) and reports probability-of-profit and
+expected value against that band — so a fly that clears the R:R ceiling but
+sits inside a move that would blow it out is flagged as negative-EV. The
+move band never changes which fly is selected; it only annotates and warns.
+
 This module is pure logic: no Rich, no Click. Network access happens only
 inside :func:`recommend_fly`. Everything else operates on plain DataFrames
 and is unit-testable offline.
@@ -31,6 +38,7 @@ import logging
 import math
 from dataclasses import dataclass, field
 from datetime import date
+from statistics import NormalDist
 from typing import Optional
 
 import numpy as np
@@ -51,6 +59,19 @@ DEFAULT_MIN_DTE = 2
 DEFAULT_MAX_DTE = 5
 DEFAULT_IV_FALLBACK = 0.25  # when the chain has no usable IV at a strike
 BASE_SIZING_PCT = (0.5, 1.0)  # % of account per fly (low, high)
+
+# Forward 1-sigma move (as a fraction of spot) a scheduled macro print
+# typically injects on its release day. Heuristic, drawn from the rough
+# historical one-day SPX reaction to each release; added in quadrature to the
+# IV-implied diffusion so the expected-move band widens around macro events.
+# Only events landing strictly AFTER today count (an already-printed event is
+# behind us for a forward trade). Tune freely — these are not market-implied.
+EVENT_VOL_ADDON: dict[str, float] = {
+    "fomc": 0.011,
+    "cpi": 0.009,
+    "nfp": 0.007,
+    "ppi": 0.004,
+}
 
 
 class UnpriceableStrikeError(ValueError):
@@ -111,6 +132,17 @@ class FlyRecommendation:
     account_size: Optional[float] = None
     min_rr: float = DEFAULT_MIN_RR
     data_source: str = "Yahoo Finance"
+    # Expected-move / macro-uncertainty model (informational; never alters
+    # which fly is selected — see recommend_fly).
+    atm_iv: Optional[float] = None              # interpolated ATM implied vol
+    expected_move_pct: Optional[float] = None   # 1-sigma move to expiry, % of spot
+    expected_move_dollars: Optional[float] = None  # 1-sigma move in underlying points
+    em_diffusion: Optional[float] = None        # IV-implied component (points)
+    em_event_pct: float = 0.0                   # macro-event add-on (% of spot)
+    event_addons: list[dict] = field(default_factory=list)  # per-event breakdown
+    prob_profit: Optional[float] = None         # P(settle inside breakevens)
+    expected_value: Optional[float] = None      # EV per fly, dollars (net of debit)
+    body_sigma: Optional[float] = None          # |body - spot| in expected-move sigmas
 
     def to_dict(self) -> dict:
         def per_fly(v: Optional[float]) -> Optional[float]:
@@ -147,6 +179,15 @@ class FlyRecommendation:
             "account_size": self.account_size,
             "min_rr": self.min_rr,
             "data_source": self.data_source,
+            "atm_iv": round(self.atm_iv, 4) if self.atm_iv is not None else None,
+            "expected_move_pct": round(self.expected_move_pct, 4) if self.expected_move_pct is not None else None,
+            "expected_move_dollars": round(self.expected_move_dollars, 2) if self.expected_move_dollars is not None else None,
+            "em_diffusion_dollars": round(self.em_diffusion, 2) if self.em_diffusion is not None else None,
+            "em_event_pct": round(self.em_event_pct, 4),
+            "event_addons": list(self.event_addons),
+            "prob_profit": round(self.prob_profit, 4) if self.prob_profit is not None else None,
+            "expected_value_per_fly": round(self.expected_value, 2) if self.expected_value is not None else None,
+            "body_sigma": round(self.body_sigma, 2) if self.body_sigma is not None else None,
             "disclaimer": "Analysis only — not financial advice. OI as of last close; verify on your broker before entry.",
         }
         return d
@@ -407,6 +448,114 @@ def floor_to_cent(value: float) -> float:
     return math.floor(value * 100 + 1e-9) / 100
 
 
+# ── Expected-move / macro-uncertainty model ──────────────────────────────────
+
+def atm_iv(chain: pd.DataFrame, spot: float) -> float:
+    """At-the-money implied vol: linear-interpolate the chain's ``iv`` at spot.
+
+    Uses the two strikes bracketing spot; falls back to the nearest usable
+    strike when spot sits outside the listed range, then to
+    ``DEFAULT_IV_FALLBACK`` when the chain carries no usable IV at all.
+    """
+    if chain is None or chain.empty or "iv" not in chain.columns or spot <= 0:
+        return DEFAULT_IV_FALLBACK
+    df = chain[["strike", "iv"]].dropna()
+    df = df[df["iv"] > 1e-4]
+    if df.empty:
+        return DEFAULT_IV_FALLBACK
+    strikes = df["strike"].to_numpy(dtype=float)
+    ivs = df["iv"].to_numpy(dtype=float)
+    below = strikes[strikes <= spot]
+    above = strikes[strikes >= spot]
+    if below.size and above.size:
+        k_lo, k_hi = float(below.max()), float(above.min())
+        iv_lo = float(ivs[strikes == k_lo][0])
+        iv_hi = float(ivs[strikes == k_hi][0])
+        if k_hi == k_lo:
+            return iv_lo
+        w = (spot - k_lo) / (k_hi - k_lo)
+        return iv_lo + w * (iv_hi - iv_lo)
+    idx = int(np.argmin(np.abs(strikes - spot)))
+    return float(ivs[idx])
+
+
+def event_vol_addon(events, today: date, expiry: date) -> tuple[float, list[dict]]:
+    """Forward macro-event vol add-on (1-sigma, as a fraction of spot).
+
+    Sums in quadrature the :data:`EVENT_VOL_ADDON` contribution of every macro
+    event landing strictly after ``today`` and on/before ``expiry``. An event
+    dated today is treated as already reflected in spot/IV (its move is behind
+    a forward trade), so it adds no forward uncertainty. Unknown categories are
+    ignored. Returns ``(addon_pct, breakdown)``.
+    """
+    breakdown: list[dict] = []
+    var = 0.0
+    for evt in sorted(events, key=lambda e: e.date):
+        if not (today < evt.date <= expiry):
+            continue
+        pct = EVENT_VOL_ADDON.get(evt.category.value)
+        if pct is None:
+            continue
+        var += pct * pct
+        breakdown.append({"name": evt.name, "date": evt.date.isoformat(), "pct": pct})
+    return math.sqrt(var), breakdown
+
+
+def expected_move(spot: float, iv: float, dte: int, event_pct: float = 0.0) -> dict:
+    """1-sigma expected move to expiry in underlying points.
+
+    Combines the IV-implied diffusion ``S·IV·sqrt(DTE/365)`` with a macro-event
+    component ``S·event_pct`` in quadrature. Returns ``{diffusion, event,
+    total, pct}`` (pct = total / spot).
+    """
+    t = max(dte, 0) / 365.0
+    diffusion = spot * max(iv, 0.0) * math.sqrt(t) if t > 0 else 0.0
+    event = spot * max(event_pct, 0.0)
+    total = math.sqrt(diffusion * diffusion + event * event)
+    return {
+        "diffusion": diffusion,
+        "event": event,
+        "total": total,
+        "pct": (total / spot) if spot > 0 else 0.0,
+    }
+
+
+def prob_in_profit(
+    breakeven_low: float, breakeven_high: float, sigma: float, center: float,
+) -> float:
+    """P(settle lands between the breakevens) under N(center, sigma).
+
+    Normal approximation, no vol skew. Degrades to a point mass when sigma≈0.
+    """
+    if sigma <= 1e-9:
+        return 1.0 if breakeven_low <= center <= breakeven_high else 0.0
+    nd = NormalDist(center, sigma)
+    return max(0.0, min(1.0, nd.cdf(breakeven_high) - nd.cdf(breakeven_low)))
+
+
+def fly_expected_value(
+    body: float, width: float, debit: float, sigma: float, center: float,
+    steps: int = 400,
+) -> float:
+    """Expected net P&L per share of the 1-2-1 fly under N(center, sigma).
+
+    Numeric midpoint integration over ±5 sigma of
+    ``max(0, width - |S - body|) - debit``. Multiply by 100 for per-fly
+    dollars. Falls back to the point payoff when sigma≈0.
+    """
+    if sigma <= 1e-9:
+        return max(0.0, width - abs(center - body)) - debit
+    nd = NormalDist(center, sigma)
+    lo, hi = center - 5 * sigma, center + 5 * sigma
+    step = (hi - lo) / steps
+    ev = 0.0
+    for i in range(steps):
+        mid = lo + (i + 0.5) * step
+        payoff = max(0.0, width - abs(mid - body)) - debit
+        ev += payoff * nd.pdf(mid) * step
+    return ev
+
+
 # ── Adaptive wing width ──────────────────────────────────────────────────────
 
 def adaptive_width(
@@ -625,6 +774,27 @@ def recommend_fly(
             "Verify the OI wall on your broker before trusting this pin."
         )
 
+    # ── Expected-move / macro-uncertainty model (informational only) ──
+    # Computed up front so a NO-TRADE rec still carries the band that
+    # explains why nothing fit. Never alters which fly is selected.
+    catalog = EventCatalog()
+    macro_events = [e for e in catalog.events
+                    if e.category.value in MACRO_EVENT_CATEGORIES]
+    in_window = [e for e in macro_events if today <= e.date <= expiry]
+    coverage = max((e.date for e in macro_events), default=None)
+    atm = atm_iv(chain, spot)
+    event_pct, event_breakdown = event_vol_addon(in_window, today, expiry)
+    em = expected_move(spot, atm, dte, event_pct)
+    em_fields = dict(
+        atm_iv=atm,
+        expected_move_pct=em["pct"],
+        expected_move_dollars=em["total"],
+        em_diffusion=em["diffusion"],
+        em_event_pct=event_pct,
+        event_addons=event_breakdown,
+        body_sigma=(abs(body - spot) / em["total"]) if em["total"] > 0 else None,
+    )
+
     result = adaptive_width(chain, body, right, expiry, min_rr, fixed_width)
     if result["selected_width"] is None:
         rec = _no_trade(base, f"no wing width meets the 1:{min_rr:g} debit ceiling")
@@ -633,6 +803,8 @@ def recommend_fly(
         rec.band_rank = pin["oi_rank"]
         rec.expiry_pin_oi = pin["concentration"]
         rec.warnings = oi_warnings
+        for k, v in em_fields.items():
+            setattr(rec, k, v)
         return rec
 
     width, debit, legs = result["selected_width"], result["debit"], result["legs"]
@@ -640,13 +812,20 @@ def recommend_fly(
     ratio = evaluate_ratio(debit, width, body)
 
     # ── Event skip rule ───────────────────────────────────────────────
-    catalog = EventCatalog()
-    macro_events = [e for e in catalog.events
-                    if e.category.value in MACRO_EVENT_CATEGORIES]
-    in_window = [e for e in macro_events if today <= e.date <= expiry]
-    coverage = max((e.date for e in macro_events), default=None)
     warnings, half_size = event_warnings(in_window, coverage, today, expiry)
     warnings = oi_warnings + warnings
+
+    # ── Probability of profit / expected value under the move band ────
+    pop = prob_in_profit(ratio["breakeven_low"], ratio["breakeven_high"],
+                         em["total"], spot)
+    ev_per_fly = fly_expected_value(body, width, debit, em["total"], spot) * 100
+    be_half_width = width - debit
+    if em["total"] > be_half_width:
+        warnings.append(
+            f"±1σ expected move (±{em['pct'] * 100:.1f}% / ±${em['total']:.2f}) "
+            f"exceeds the fly's breakeven half-width (${be_half_width:.2f}) — a "
+            f"typical move finishes this fly at a loss (POP ≈ {pop * 100:.0f}%)."
+        )
 
     sizing = (BASE_SIZING_PCT[0] / 2, BASE_SIZING_PCT[1] / 2) if half_size else BASE_SIZING_PCT
 
@@ -667,6 +846,9 @@ def recommend_fly(
         warnings=warnings,
         width_attempts=result["attempts"],
         sizing_pct=sizing,
+        prob_profit=pop,
+        expected_value=ev_per_fly,
+        **em_fields,
     )
     rec.selected_width = width
     rec.width_was_adaptive = result["adaptive"]

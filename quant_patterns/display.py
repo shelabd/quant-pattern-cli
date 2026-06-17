@@ -1203,6 +1203,16 @@ def display_regime_conditional_winrates(ticker: str, category: str, regime_winra
 
 # ── Pin Butterfly Ticket ─────────────────────────────────────────────────────
 
+def _expected_move_line(rec) -> str:
+    """One-line expected-move summary: ±%, ±$, and what drives it."""
+    src = [f"IV {rec.atm_iv * 100:.0f}%"] if rec.atm_iv is not None else []
+    if rec.event_addons:
+        src.append(", ".join(a["name"].split(" ")[0] for a in rec.event_addons))
+    suffix = f" — {' ⊕ '.join(src)}" if src else ""
+    return (f"Expected move (1σ): ±{rec.expected_move_pct * 100:.1f}% "
+            f"(±${rec.expected_move_dollars:.2f}){suffix}")
+
+
 def display_fly(rec) -> None:
     """Render a FlyRecommendation as an order ticket panel.
 
@@ -1233,6 +1243,8 @@ def display_fly(rec) -> None:
         console.print(Text(f"\n  ✗ NO TRADE — {rec.no_trade_reason}", style="bold red"))
         for attempt in rec.width_attempts:
             console.print(Text(f"    width {attempt['width']:g}: {attempt['result']}", style="dim"))
+        if rec.expected_move_pct is not None:
+            console.print(Text(f"    {_expected_move_line(rec)}", style="dim"))
         for w in rec.warnings:
             console.print(Text(f"  ⚠ {w}", style="yellow"))
         console.print()
@@ -1269,6 +1281,27 @@ def display_fly(rec) -> None:
     stats.add_row("Max payout (per fly)", Text(f"${rec.max_profit * 100:.2f}", style="bold green"))
     stats.add_row("Risk : Reward", Text(f"1 : {rec.risk_reward:.1f}", style=f"bold {rr_color}"))
     stats.add_row("Breakevens", f"{rec.breakeven_low:.2f} / {rec.breakeven_high:.2f}")
+
+    # Expected-move / uncertainty (informational)
+    if rec.expected_move_pct is not None:
+        em_color = "yellow" if rec.expected_move_dollars > (rec.selected_width - rec.debit) else "white"
+        stats.add_row("Expected move (1σ)", Text(
+            f"±{rec.expected_move_pct * 100:.1f}% (±${rec.expected_move_dollars:.2f})"
+            + (f"  [IV {rec.atm_iv * 100:.0f}%"
+               + (" ⊕ " + ", ".join(a["name"].split(" ")[0] for a in rec.event_addons)
+                  if rec.event_addons else "") + "]"),
+            style=em_color))
+    if rec.prob_profit is not None:
+        pop = rec.prob_profit
+        pop_color = "green" if pop >= 0.40 else "yellow" if pop >= 0.25 else "red"
+        stats.add_row("Prob. of profit", Text(f"{pop * 100:.0f}%", style=f"bold {pop_color}"))
+    if rec.expected_value is not None:
+        ev_color = "green" if rec.expected_value >= 0 else "red"
+        stats.add_row("Exp. value (per fly)", Text(f"${rec.expected_value:+.2f}", style=f"bold {ev_color}"))
+    if rec.body_sigma is not None:
+        side = "above" if rec.body_strike > rec.spot else "below" if rec.body_strike < rec.spot else "at"
+        stats.add_row("Body vs spot", f"{rec.body_sigma:.2f}σ {side} spot")
+
     stats.add_row("Body OI / band rank", f"{rec.body_oi:,} / #{rec.band_rank}")
     stats.add_row("Suggested limit", Text(
         f"${rec.limit_price:.2f} per share (${rec.limit_price * 100:.2f} per fly)",

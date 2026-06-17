@@ -7,18 +7,25 @@ import pandas as pd
 import pytest
 
 from quant_patterns.butterfly import (
+    DEFAULT_IV_FALLBACK,
+    EVENT_VOL_ADDON,
     UnpriceableStrikeError,
     adaptive_width,
+    atm_iv,
     band_bounds,
     bs_gamma,
     choose_expiry,
     detect_drift,
     evaluate_ratio,
+    event_vol_addon,
     event_warnings,
+    expected_move,
     floor_to_cent,
+    fly_expected_value,
     max_debit_for,
     mid_price,
     normalize_chain,
+    prob_in_profit,
     price_fly,
     score_pins,
     select_pin,
@@ -341,3 +348,95 @@ class TestNormalizeChain:
         puts["impliedVolatility"] = np.nan
         chain = normalize_chain(calls, puts)
         assert chain.iloc[0]["iv"] > 0  # DEFAULT_IV_FALLBACK
+
+
+# ── Expected-move / macro-uncertainty model ───────────────────────────────────
+
+
+class _MacroEvt:
+    """Minimal MarketEvent stand-in with the .category.value the addon reads."""
+    def __init__(self, name, d, cat):
+        self.name = name
+        self.date = d
+        self.category = type("C", (), {"value": cat})()
+
+
+class TestAtmIv:
+    def test_interpolates_between_strikes(self):
+        chain = make_chain([580, 590], iv=0.2)
+        chain.loc[chain.strike == 580, "iv"] = 0.18
+        chain.loc[chain.strike == 590, "iv"] = 0.28
+        # spot halfway -> iv halfway
+        assert atm_iv(chain, 585.0) == pytest.approx(0.23, abs=1e-9)
+
+    def test_nearest_when_spot_outside_range(self):
+        chain = make_chain([580, 590], iv=0.2)
+        assert atm_iv(chain, 999.0) == pytest.approx(0.2)
+
+    def test_fallback_when_no_usable_iv(self):
+        chain = make_chain([580], iv=0.0)  # zeroed -> filtered out
+        assert atm_iv(chain, 580.0) == DEFAULT_IV_FALLBACK
+
+
+class TestEventVolAddon:
+    def test_future_event_adds_in_quadrature(self):
+        evts = [_MacroEvt("FOMC", TODAY + timedelta(days=1), "fomc"),
+                _MacroEvt("CPI", TODAY + timedelta(days=2), "cpi")]
+        pct, breakdown = event_vol_addon(evts, TODAY, EXPIRY)
+        expected = (EVENT_VOL_ADDON["fomc"] ** 2 + EVENT_VOL_ADDON["cpi"] ** 2) ** 0.5
+        assert pct == pytest.approx(expected)
+        assert len(breakdown) == 2
+
+    def test_event_today_is_excluded(self):
+        # an event dated today already printed — no forward uncertainty
+        evts = [_MacroEvt("FOMC", TODAY, "fomc")]
+        pct, breakdown = event_vol_addon(evts, TODAY, EXPIRY)
+        assert pct == 0.0
+        assert breakdown == []
+
+    def test_unknown_category_ignored(self):
+        evts = [_MacroEvt("Mystery", TODAY + timedelta(days=1), "gdp")]
+        pct, breakdown = event_vol_addon(evts, TODAY, EXPIRY)
+        assert pct == 0.0
+
+
+class TestExpectedMove:
+    def test_diffusion_only(self):
+        em = expected_move(750.0, 0.20, dte=4, event_pct=0.0)
+        manual = 750.0 * 0.20 * (4 / 365.0) ** 0.5
+        assert em["total"] == pytest.approx(manual)
+        assert em["pct"] == pytest.approx(manual / 750.0)
+        assert em["event"] == 0.0
+
+    def test_event_widens_band(self):
+        base = expected_move(750.0, 0.20, dte=4, event_pct=0.0)["total"]
+        bumped = expected_move(750.0, 0.20, dte=4, event_pct=0.011)["total"]
+        assert bumped > base
+
+
+class TestProbInProfit:
+    def test_symmetric_band_centered(self):
+        # breakevens symmetric about center -> POP = P(|Z| < be/sigma)
+        pop = prob_in_profit(740.0, 760.0, sigma=10.0, center=750.0)
+        assert pop == pytest.approx(0.6827, abs=2e-3)  # ~1 sigma each side
+
+    def test_degenerate_sigma(self):
+        assert prob_in_profit(740.0, 760.0, sigma=0.0, center=750.0) == 1.0
+        assert prob_in_profit(740.0, 760.0, sigma=0.0, center=800.0) == 0.0
+
+
+class TestFlyExpectedValue:
+    def test_zero_sigma_is_point_payoff(self):
+        # settle pinned at body -> max profit = width - debit
+        ev = fly_expected_value(750.0, 3.0, 0.5, sigma=0.0, center=750.0)
+        assert ev == pytest.approx(2.5)
+
+    def test_wide_sigma_loses_the_debit(self):
+        # huge move -> fly almost always expires worthless -> EV ~ -debit
+        ev = fly_expected_value(750.0, 3.0, 0.5, sigma=200.0, center=750.0)
+        assert ev == pytest.approx(-0.5, abs=0.05)
+
+    def test_tighter_sigma_beats_wider(self):
+        tight = fly_expected_value(750.0, 3.0, 0.5, sigma=3.0, center=750.0)
+        wide = fly_expected_value(750.0, 3.0, 0.5, sigma=15.0, center=750.0)
+        assert tight > wide
