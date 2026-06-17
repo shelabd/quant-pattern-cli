@@ -165,3 +165,49 @@ class TestSummarize:
         scored, _ = score_journal(entries, get_close=lambda t, d: 733.0,
                                   today=date(2026, 6, 18))
         assert json.loads(json.dumps(summarize(scored)))["n_trades"] == 1
+
+# ── Expected-move forecast calibration ────────────────────────────────────────
+
+
+def _scored_forecast(settle, pop, ev, body=733.0, width=3.0, debit=0.20):
+    """A scored PASS entry carrying ex-ante POP / EV forecast fields."""
+    e = entry_dict(body=body, width=width, debit=debit)
+    e["prob_profit"] = pop
+    e["expected_value_per_fly"] = ev
+    return score_entry(e, settle=settle)
+
+
+class TestCalibration:
+    def test_pop_and_ev_calibration(self):
+        scored = [
+            _scored_forecast(settle=733.0, pop=0.7, ev=50.0),   # win,  +280/fly
+            _scored_forecast(settle=740.0, pop=0.2, ev=-10.0),  # loss,  -20/fly
+        ]
+        cal = summarize(scored)["calibration"]
+        assert cal["n_forecast"] == 2
+        assert cal["mean_pred_pop"] == pytest.approx(0.45)
+        assert cal["actual_win_rate"] == pytest.approx(0.5)
+        # Brier = mean((0.7-1)^2, (0.2-0)^2) = (0.09 + 0.04)/2
+        assert cal["pop_brier"] == pytest.approx(0.065)
+        assert cal["mean_pred_ev_per_fly"] == pytest.approx(20.0)
+        assert cal["mean_actual_pnl_per_fly"] == pytest.approx(130.0)
+        assert cal["ev_bias_per_fly"] == pytest.approx(110.0)  # actual − predicted
+
+    def test_absent_without_forecast_fields(self):
+        # Legacy entries (pre-feature) carry prob_profit=None → no calibration.
+        scored = [score_entry(entry_dict(body=733.0, width=3.0, debit=0.20), settle=733.0)]
+        assert "calibration" not in summarize(scored)
+
+    def test_buckets_group_by_predicted_pop(self):
+        scored = [
+            _scored_forecast(settle=733.0, pop=0.70, ev=50.0),
+            _scored_forecast(settle=733.0, pop=0.65, ev=40.0),
+            _scored_forecast(settle=740.0, pop=0.10, ev=-10.0),
+        ]
+        buckets = summarize(scored)["calibration"]["buckets"]
+        assert any(b["n"] == 2 and b["range"] == "60%–100%" for b in buckets)
+        assert any(b["n"] == 1 and b["range"] == "0%–20%" for b in buckets)
+
+    def test_json_serializable(self):
+        scored = [_scored_forecast(settle=733.0, pop=0.6, ev=30.0)]
+        assert json.loads(json.dumps(summarize(scored)))["calibration"]["n_forecast"] == 1

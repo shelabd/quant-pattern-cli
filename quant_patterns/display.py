@@ -1357,6 +1357,40 @@ def display_journal(scored: list, pending: list, stats: dict) -> None:
                         f"(best {stats['best_r']:+.2f} / worst {stats['worst_r']:+.2f})", style="dim")
         console.print(Panel(text, border_style="cyan"))
 
+        cal = stats.get("calibration")
+        if cal:
+            ctext = Text()
+            ctext.append(f"Forecast calibration ({cal['n_forecast']} trades)\n", style="bold white")
+            ctext.append("POP — predicted: ", style="white")
+            ctext.append(f"{cal['mean_pred_pop']:.0%}", style="bold cyan")
+            ctext.append("  vs actual win rate: ", style="white")
+            ctext.append(f"{cal['actual_win_rate']:.0%}", style="bold cyan")
+            brier_style = "green" if cal["pop_brier"] <= 0.20 else "yellow" if cal["pop_brier"] <= 0.25 else "red"
+            ctext.append("  |  Brier: ", style="white")
+            ctext.append(f"{cal['pop_brier']:.3f}", style=f"bold {brier_style}")
+            ctext.append(" (0=perfect, 0.25=coin flip)", style="dim")
+            if cal.get("mean_pred_ev_per_fly") is not None:
+                bias = cal["ev_bias_per_fly"]
+                bias_style = "green" if bias >= 0 else "red"
+                ctext.append("\nEV/fly — predicted: ", style="white")
+                ctext.append(f"${cal['mean_pred_ev_per_fly']:+,.2f}", style="bold cyan")
+                ctext.append("  vs actual P&L: ", style="white")
+                ctext.append(f"${cal['mean_actual_pnl_per_fly']:+,.2f}", style="bold cyan")
+                ctext.append("  |  bias: ", style="white")
+                ctext.append(f"${bias:+,.2f}", style=f"bold {bias_style}")
+                ctext.append(" (actual − predicted)", style="dim")
+            console.print(Panel(ctext, title="[bold]Expected-Move Model[/bold]", border_style="magenta"))
+
+            buckets = cal.get("buckets") or []
+            if len(buckets) > 1:
+                btable = Table(box=box.SIMPLE, header_style="bold magenta", title="POP reliability")
+                for col in ["POP bucket", "n", "Pred POP", "Actual win"]:
+                    btable.add_column(col, justify="right" if col != "POP bucket" else "left", no_wrap=True)
+                for b in buckets:
+                    btable.add_row(b["range"], str(b["n"]),
+                                   f"{b['mean_pred_pop']:.0%}", f"{b['actual_win_rate']:.0%}")
+                console.print(btable)
+
         table = Table(box=box.ROUNDED, header_style="bold cyan", title="Scored")
         for col, justify in [("As-of", "left"), ("Ticker", "left"), ("Expiry", "left"),
                              ("Pin", "right"), ("W", "right"), ("Debit", "right"),

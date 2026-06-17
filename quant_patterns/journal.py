@@ -137,11 +137,34 @@ def score_journal(
     return scored, pending
 
 
+def _pop_buckets(forecast: list[dict], edges=(0.2, 0.4, 0.6)) -> list[dict]:
+    """Bucket forecasted trades by predicted POP and report realized win rate.
+
+    Reliability table: a well-calibrated model's predicted POP should track
+    the actual win rate inside each bucket. Empty buckets are dropped.
+    """
+    bounds = [0.0, *edges, 1.0001]
+    buckets = []
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        grp = [e for e in forecast if lo <= e["prob_profit"] < hi]
+        if grp:
+            buckets.append({
+                "range": f"{lo:.0%}–{min(hi, 1.0):.0%}",
+                "n": len(grp),
+                "mean_pred_pop": round(mean(e["prob_profit"] for e in grp), 3),
+                "actual_win_rate": round(mean(1.0 if e["win"] else 0.0 for e in grp), 3),
+            })
+    return buckets
+
+
 def summarize(scored: list[dict]) -> dict:
     """Aggregate forward-test stats across scored entries.
 
     Pin accuracy uses every scored entry (NO TRADE pins still test the
-    pin hypothesis); trade stats use only priced PASS entries.
+    pin hypothesis); trade stats use only priced PASS entries. When entries
+    carry the expected-move forecast (prob_profit / expected_value_per_fly),
+    a calibration block compares those ex-ante predictions to realized
+    outcomes — the only honest test of whether the move model adds edge.
     """
     pin_pcts = [abs(e["pin_dist_pct"]) for e in scored if e.get("pin_dist_pct") is not None]
     trades = [e for e in scored if e.get("win") is not None]
@@ -161,4 +184,31 @@ def summarize(scored: list[dict]) -> dict:
             "best_r": max(e["r_multiple"] for e in trades),
             "worst_r": min(e["r_multiple"] for e in trades),
         })
+
+    # ── Expected-move forecast calibration (POP & EV vs realized) ────────
+    forecast = [e for e in trades if e.get("prob_profit") is not None]
+    if forecast:
+        wins = [1.0 if e["win"] else 0.0 for e in forecast]
+        pops = [e["prob_profit"] for e in forecast]
+        cal = {
+            "n_forecast": len(forecast),
+            "mean_pred_pop": round(mean(pops), 3),
+            "actual_win_rate": round(mean(wins), 3),
+            # Brier score: mean squared error of the probability forecast
+            # (0 = perfect, 0.25 = a coin flip, lower is better).
+            "pop_brier": round(mean((p - w) ** 2 for p, w in zip(pops, wins)), 4),
+            "buckets": _pop_buckets(forecast),
+        }
+        ev_pairs = [(e["expected_value_per_fly"], e["pnl_per_fly"]) for e in forecast
+                    if e.get("expected_value_per_fly") is not None]
+        if ev_pairs:
+            pred_ev = [p for p, _ in ev_pairs]
+            actual = [a for _, a in ev_pairs]
+            cal.update({
+                "mean_pred_ev_per_fly": round(mean(pred_ev), 2),
+                "mean_actual_pnl_per_fly": round(mean(actual), 2),
+                # realized minus predicted: >0 means the model under-promised.
+                "ev_bias_per_fly": round(mean(actual) - mean(pred_ev), 2),
+            })
+        out["calibration"] = cal
     return out
