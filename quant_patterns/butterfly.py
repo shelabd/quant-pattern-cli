@@ -2,18 +2,23 @@
 Pin butterfly recommendation engine — the "3-Day Pin Fly" strategy.
 
 A short-dated (2-5 DTE) butterfly whose body sits on the highest
-open-interest "pin" strike near spot, targeting a structural risk:reward of
-at least 1:5 (ideal 1:15). The engine detects price drift, scores strikes
-inside a directional band by gamma-weighted open interest, selects the
-expiry whose pin OI concentration is highest, and walks an adaptive wing
-width (5 → 3 → 2) until the debit fits the ceiling `width / (min_rr + 1)`.
+open-interest "pin" strike near spot. The engine detects price drift, scores
+strikes inside a directional band by gamma-weighted open interest, and selects
+the expiry whose pin OI concentration is highest.
 
-On top of that structural pick it overlays an *informational* expected-move
-model (IV-implied diffusion ⊕ a macro-event vol bump for FOMC/CPI/PPI/NFP
-landing in the holding window) and reports probability-of-profit and
-expected value against that band — so a fly that clears the R:R ceiling but
-sits inside a move that would blow it out is flagged as negative-EV. The
-move band never changes which fly is selected; it only annotates and warns.
+Wing-width selection has two modes. The default **POP mode** searches every
+symmetric width listed in the chain and picks the one that maximizes
+probability of profit among *positive-EV* flies — high-POP flies are wide
+(their tent covers more of the expected-move distribution), so this trades
+fat headline risk:reward for a fly that actually tends to pin. The legacy
+**payout mode** instead walks the adaptive ladder (5 → 3 → 2) until the debit
+fits the R:R ceiling `width / (min_rr + 1)`, maximizing headline risk:reward.
+
+Both modes rest on an expected-move model: IV-implied diffusion ⊕ a
+macro-event vol bump for FOMC/CPI/PPI/NFP landing in the holding window. It
+yields the 1-sigma band, probability-of-profit, and expected value used to
+rank (POP mode) or annotate (payout mode) the fly; a fly whose ±1σ band
+exceeds its breakeven half-width is flagged as likely to finish at a loss.
 
 This module is pure logic: no Rich, no Click. Network access happens only
 inside :func:`recommend_fly`. Everything else operates on plain DataFrames
@@ -51,6 +56,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MIN_RR = 5.0
 IDEAL_RR = 15.0
+DEFAULT_TARGET_POP = 0.55      # POP-mode target; engine maximizes POP among +EV flies
+POP_MIN_RR = 1.0               # POP-mode floor: keeps the fly balanced (debit ≤ width/2),
+                               # blocking deep-ITM "boxes" that are +EV but torch capital
+POP_MAX_WIDTH_FLOOR = 12.0     # POP-mode width search caps at max(this, 2·sigma)
 WIDTH_LADDER: tuple[float, ...] = (5.0, 3.0, 2.0)
 MIN_WIDTH = 2.0
 ROUND_NUMBER_BONUS = 1.10
@@ -131,6 +140,8 @@ class FlyRecommendation:
     sizing_pct: tuple[float, float] = BASE_SIZING_PCT
     account_size: Optional[float] = None
     min_rr: float = DEFAULT_MIN_RR
+    select_mode: str = "pop"               # "pop" | "payout" | "fixed"
+    target_pop: float = DEFAULT_TARGET_POP
     data_source: str = "Yahoo Finance"
     # Expected-move / macro-uncertainty model (informational; never alters
     # which fly is selected — see recommend_fly).
@@ -178,6 +189,8 @@ class FlyRecommendation:
             "sizing_pct": {"low": self.sizing_pct[0], "high": self.sizing_pct[1]},
             "account_size": self.account_size,
             "min_rr": self.min_rr,
+            "select_mode": self.select_mode,
+            "target_pop": round(self.target_pop, 4),
             "data_source": self.data_source,
             "atm_iv": round(self.atm_iv, 4) if self.atm_iv is not None else None,
             "expected_move_pct": round(self.expected_move_pct, 4) if self.expected_move_pct is not None else None,
@@ -602,6 +615,106 @@ def adaptive_width(
             "attempts": attempts, "adaptive": fixed_width is None}
 
 
+def candidate_widths(
+    chain: pd.DataFrame,
+    body: float,
+    min_width: float = MIN_WIDTH,
+    max_width: Optional[float] = None,
+) -> list[float]:
+    """Symmetric wing widths actually listed on both sides of the body.
+
+    A butterfly needs both ``body - w`` and ``body + w`` to exist in the
+    chain. Returns the sorted list of such widths in ``[min_width,
+    max_width]`` — the search space for POP-based selection.
+    """
+    strikes = np.sort(np.unique(chain["strike"].to_numpy(dtype=float)))
+    widths: list[float] = []
+    for k in strikes:
+        w = round(float(k - body), 4)
+        if w < min_width:
+            continue
+        if max_width is not None and w > max_width + 1e-9:
+            break
+        if (np.any(np.isclose(strikes, body - w))
+                and np.any(np.isclose(strikes, body + w))):
+            widths.append(w)
+    return widths
+
+
+def select_width_by_pop(
+    chain: pd.DataFrame,
+    body: float,
+    right: str,
+    expiry: date,
+    sigma: float,
+    center: float,
+    target_pop: float = DEFAULT_TARGET_POP,
+    min_rr: float = POP_MIN_RR,
+    max_width: Optional[float] = None,
+    widths: Optional[list[float]] = None,
+) -> dict:
+    """Pick the wing width that maximizes probability of profit.
+
+    High-POP flies are *wide*: their tent covers more of the move
+    distribution, which makes them expensive — the opposite of the
+    R:R-maximizing ladder. Every symmetric width listed in the chain is
+    priced, then scored for POP and EV per fly under N(center, sigma).
+    Selection is the highest-POP fly (tie-break on EV) that clears two
+    guardrails:
+
+    * *positive expected value* — without it "max POP" just keeps buying
+      wider, ever-more-expensive wings, and
+    * a modest *risk:reward floor* (``min_rr``, debit ≤ width/(min_rr+1)) —
+      without it the search drifts into deep-ITM "boxes" whose debit ≈ width:
+      technically +EV off intrinsic value, but R:R ≈ 0 and capital-torching.
+
+    Returns {selected, attempts, scored, eligible, had_positive,
+    reached_target, best_pop_attempt}. ``selected`` is None when nothing
+    clears both guardrails (a NO TRADE); ``best_pop_attempt`` then carries
+    the highest-POP priced candidate for the explanation. ``scored`` is
+    empty only when nothing could be priced.
+    """
+    width_list = (widths if widths is not None
+                  else candidate_widths(chain, body, max_width=max_width))
+    attempts: list[dict] = []
+    scored: list[dict] = []
+    for width in width_list:
+        try:
+            debit, legs = price_fly(chain, body, width, right, expiry)
+        except UnpriceableStrikeError as e:
+            attempts.append({"width": width, "result": f"unpriceable: {e}"})
+            continue
+        if debit <= 0:
+            attempts.append({"width": width,
+                             "result": f"non-positive mid debit {debit:.2f} (stale quotes)"})
+            continue
+        ratio = evaluate_ratio(debit, width, body)
+        pop = prob_in_profit(ratio["breakeven_low"], ratio["breakeven_high"], sigma, center)
+        ev = fly_expected_value(body, width, debit, sigma, center) * 100
+        attempts.append({"width": width,
+                         "result": f"POP {pop * 100:.0f}%  EV ${ev:+.0f}  RR 1:{ratio['risk_reward']:.1f}"})
+        scored.append({"width": width, "debit": debit, "legs": legs,
+                       "ratio": ratio, "pop": pop, "ev": ev})
+
+    if not scored:
+        return {"selected": None, "attempts": attempts, "scored": [],
+                "eligible": [], "had_positive": False, "reached_target": False,
+                "best_pop_attempt": None}
+
+    best_pop_attempt = max(scored, key=lambda c: c["pop"])
+    eligible = [c for c in scored
+                if c["ev"] > 0 and c["ratio"]["risk_reward"] >= min_rr]
+    if not eligible:
+        return {"selected": None, "attempts": attempts, "scored": scored,
+                "eligible": [], "had_positive": any(c["ev"] > 0 for c in scored),
+                "reached_target": False, "best_pop_attempt": best_pop_attempt}
+    best = max(eligible, key=lambda c: (c["pop"], c["ev"]))
+    return {"selected": best, "attempts": attempts, "scored": scored,
+            "eligible": eligible, "had_positive": True,
+            "reached_target": best["pop"] >= target_pop,
+            "best_pop_attempt": best_pop_attempt}
+
+
 # ── OI-aware expiry selection ────────────────────────────────────────────────
 
 def choose_expiry(
@@ -694,6 +807,8 @@ def recommend_fly(
     expiry_override: Optional[date] = None,
     today: Optional[date] = None,
     chain_source: str = "auto",
+    select: str = "pop",
+    target_pop: float = DEFAULT_TARGET_POP,
 ) -> FlyRecommendation:
     """End-to-end pin-fly recommendation against live data.
 
@@ -735,7 +850,9 @@ def recommend_fly(
         ticker=ticker, spot=spot, drift=drift, right="",
         expiry=None, dte=None, body_strike=None,
         selected_width=None, width_was_adaptive=fixed_width is None,
-        account_size=account, min_rr=min_rr, data_source=oprov.name(),
+        account_size=account, min_rr=min_rr,
+        select_mode="fixed" if fixed_width is not None else select,
+        target_pop=target_pop, data_source=oprov.name(),
     )
 
     if not candidates:
@@ -795,39 +912,85 @@ def recommend_fly(
         body_sigma=(abs(body - spot) / em["total"]) if em["total"] > 0 else None,
     )
 
-    result = adaptive_width(chain, body, right, expiry, min_rr, fixed_width)
-    if result["selected_width"] is None:
-        rec = _no_trade(base, f"no wing width meets the 1:{min_rr:g} debit ceiling")
-        rec.width_attempts = result["attempts"]
-        rec.body_oi = pin["total_oi"]
-        rec.band_rank = pin["oi_rank"]
-        rec.expiry_pin_oi = pin["concentration"]
-        rec.warnings = oi_warnings
-        for k, v in em_fields.items():
-            setattr(rec, k, v)
-        return rec
-
-    width, debit, legs = result["selected_width"], result["debit"], result["legs"]
-    ceiling = max_debit_for(width, min_rr)
-    ratio = evaluate_ratio(debit, width, body)
+    # ── Width selection ───────────────────────────────────────────────
+    # POP mode (default) searches every listed width for the highest-POP
+    # positive-EV fly; payout mode (and any explicit --width) walks the R:R
+    # ladder against the debit ceiling. An explicit fixed_width always keeps
+    # its R:R-ceiling semantics, so it routes through the ladder.
+    sigma = em["total"]
+    if fixed_width is None and select == "pop":
+        sel = select_width_by_pop(
+            chain, body, right, expiry, sigma, spot,
+            target_pop=target_pop, min_rr=POP_MIN_RR,
+            max_width=max(POP_MAX_WIDTH_FLOOR, 2 * sigma),
+        )
+        chosen = sel["selected"]
+        if chosen is None:
+            bp = sel["best_pop_attempt"]
+            if bp is None:
+                reason = "no priceable symmetric butterfly around the pin"
+            elif sel["had_positive"]:
+                reason = (
+                    "no balanced butterfly clears the 1:"
+                    f"{POP_MIN_RR:g} R:R floor — positive-EV widths here are "
+                    "deep-ITM boxes (debit ≈ width), not pin flies"
+                )
+            else:
+                reason = (
+                    "no positive-EV butterfly at any listed wing width — the "
+                    f"±{em['pct'] * 100:.1f}% expected move dominates every fly "
+                    f"(widest profitable POP {bp['pop'] * 100:.0f}% was still −EV)"
+                )
+            rec = _no_trade(base, reason)
+            rec.width_attempts = sel["attempts"]
+            rec.body_oi = pin["total_oi"]
+            rec.band_rank = pin["oi_rank"]
+            rec.expiry_pin_oi = pin["concentration"]
+            rec.warnings = oi_warnings
+            for k, v in em_fields.items():
+                setattr(rec, k, v)
+            return rec
+        width, debit, legs = chosen["width"], chosen["debit"], chosen["legs"]
+        ratio = chosen["ratio"]
+        attempts = sel["attempts"]
+        adaptive = True
+        ceiling = None
+        pop, ev_per_fly = chosen["pop"], chosen["ev"]
+    else:
+        result = adaptive_width(chain, body, right, expiry, min_rr, fixed_width)
+        if result["selected_width"] is None:
+            rec = _no_trade(base, f"no wing width meets the 1:{min_rr:g} debit ceiling")
+            rec.width_attempts = result["attempts"]
+            rec.body_oi = pin["total_oi"]
+            rec.band_rank = pin["oi_rank"]
+            rec.expiry_pin_oi = pin["concentration"]
+            rec.warnings = oi_warnings
+            for k, v in em_fields.items():
+                setattr(rec, k, v)
+            return rec
+        width, debit, legs = result["selected_width"], result["debit"], result["legs"]
+        ratio = evaluate_ratio(debit, width, body)
+        attempts = result["attempts"]
+        adaptive = result["adaptive"]
+        ceiling = max_debit_for(width, min_rr)
+        pop = prob_in_profit(ratio["breakeven_low"], ratio["breakeven_high"], sigma, spot)
+        ev_per_fly = fly_expected_value(body, width, debit, sigma, spot) * 100
 
     # ── Event skip rule ───────────────────────────────────────────────
     warnings, half_size = event_warnings(in_window, coverage, today, expiry)
     warnings = oi_warnings + warnings
 
-    # ── Probability of profit / expected value under the move band ────
-    pop = prob_in_profit(ratio["breakeven_low"], ratio["breakeven_high"],
-                         em["total"], spot)
-    ev_per_fly = fly_expected_value(body, width, debit, em["total"], spot) * 100
+    # ── Expected-move warning (POP mode already optimized against it) ──
     be_half_width = width - debit
-    if em["total"] > be_half_width:
+    if sigma > be_half_width:
         warnings.append(
-            f"±1σ expected move (±{em['pct'] * 100:.1f}% / ±${em['total']:.2f}) "
+            f"±1σ expected move (±{em['pct'] * 100:.1f}% / ±${sigma:.2f}) "
             f"exceeds the fly's breakeven half-width (${be_half_width:.2f}) — a "
             f"typical move finishes this fly at a loss (POP ≈ {pop * 100:.0f}%)."
         )
 
     sizing = (BASE_SIZING_PCT[0] / 2, BASE_SIZING_PCT[1] / 2) if half_size else BASE_SIZING_PCT
+    limit = floor_to_cent(debit if ceiling is None else min(debit, ceiling))
 
     rec = FlyRecommendation(
         **base,
@@ -837,19 +1000,19 @@ def recommend_fly(
         risk_reward=ratio["risk_reward"],
         breakeven_low=ratio["breakeven_low"],
         breakeven_high=ratio["breakeven_high"],
-        limit_price=floor_to_cent(min(debit, ceiling)),
+        limit_price=limit,
         max_debit_ceiling=ceiling,
         body_oi=pin["total_oi"],
         band_rank=pin["oi_rank"],
         expiry_pin_oi=pin["concentration"],
         verdict="PASS",
         warnings=warnings,
-        width_attempts=result["attempts"],
+        width_attempts=attempts,
         sizing_pct=sizing,
         prob_profit=pop,
         expected_value=ev_per_fly,
         **em_fields,
     )
     rec.selected_width = width
-    rec.width_was_adaptive = result["adaptive"]
+    rec.width_was_adaptive = adaptive
     return rec

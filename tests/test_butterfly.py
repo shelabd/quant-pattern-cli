@@ -8,12 +8,14 @@ import pytest
 
 from quant_patterns.butterfly import (
     DEFAULT_IV_FALLBACK,
+    DEFAULT_TARGET_POP,
     EVENT_VOL_ADDON,
     UnpriceableStrikeError,
     adaptive_width,
     atm_iv,
     band_bounds,
     bs_gamma,
+    candidate_widths,
     choose_expiry,
     detect_drift,
     evaluate_ratio,
@@ -29,6 +31,7 @@ from quant_patterns.butterfly import (
     price_fly,
     score_pins,
     select_pin,
+    select_width_by_pop,
 )
 
 EXPIRY = date(2026, 6, 17)
@@ -440,3 +443,87 @@ class TestFlyExpectedValue:
         tight = fly_expected_value(750.0, 3.0, 0.5, sigma=3.0, center=750.0)
         wide = fly_expected_value(750.0, 3.0, 0.5, sigma=15.0, center=750.0)
         assert tight > wide
+
+
+# ── POP-based width selection ────────────────────────────────────────────────
+
+# Convex option mids so a 1-2-1 fly always prices to a positive debit that
+# grows with width: debit(w) = f(b-w) - 2f(b) + f(b+w) = 0.02·w².
+def _convex_mid(body=740.0):
+    return lambda k: 0.01 * (k - body) ** 2 + 1.0
+
+
+class TestCandidateWidths:
+    def test_only_symmetric_listed_widths(self):
+        strikes = [720, 725, 730, 735, 740, 745, 750, 755, 760]
+        chain = make_chain(strikes, mid_fn=_convex_mid())
+        assert candidate_widths(chain, body=740.0) == [5.0, 10.0, 15.0, 20.0]
+
+    def test_min_width_filters_tight_wings(self):
+        strikes = [738, 739, 740, 741, 742]
+        chain = make_chain(strikes, mid_fn=_convex_mid())
+        # widths 1 and 2 listed; default MIN_WIDTH=2 drops the 1-wide
+        assert candidate_widths(chain, body=740.0) == [2.0]
+
+    def test_max_width_caps_search(self):
+        strikes = [720, 725, 730, 735, 740, 745, 750, 755, 760]
+        chain = make_chain(strikes, mid_fn=_convex_mid())
+        assert candidate_widths(chain, body=740.0, max_width=12.0) == [5.0, 10.0]
+
+    def test_asymmetric_strike_dropped(self):
+        # 730 has no mirror (750 missing) -> width 10 excluded
+        strikes = [730, 735, 740, 745]
+        chain = make_chain(strikes, mid_fn=_convex_mid())
+        assert candidate_widths(chain, body=740.0) == [5.0]
+
+
+class TestSelectWidthByPop:
+    def _chain(self):
+        strikes = [720, 725, 730, 735, 740, 745, 750, 755, 760]
+        return make_chain(strikes, mid_fn=_convex_mid())
+
+    def test_prefers_widest_high_pop_fly(self):
+        # Tight sigma -> every listed fly is +EV, so the highest-POP (widest)
+        # wins. The R:R-ladder would have picked the narrowest (5) instead.
+        sel = select_width_by_pop(self._chain(), body=740.0, right="CALL",
+                                  expiry=EXPIRY, sigma=6.0, center=740.0)
+        assert sel["selected"] is not None
+        assert sel["selected"]["width"] == 20.0
+        assert sel["had_positive"] is True
+        assert sel["reached_target"] is True
+        # selected POP is the max POP across all scored candidates
+        assert sel["selected"]["pop"] == max(c["pop"] for c in sel["scored"])
+
+    def test_no_positive_ev_is_no_trade(self):
+        # A move that dwarfs every tent -> all candidates negative-EV.
+        sel = select_width_by_pop(self._chain(), body=740.0, right="CALL",
+                                  expiry=EXPIRY, sigma=300.0, center=740.0)
+        assert sel["selected"] is None
+        assert sel["had_positive"] is False
+        assert sel["best_pop_attempt"] is not None  # carried for the reason text
+
+    def test_selected_is_positive_ev(self):
+        sel = select_width_by_pop(self._chain(), body=740.0, right="CALL",
+                                  expiry=EXPIRY, sigma=8.0, center=740.0,
+                                  target_pop=DEFAULT_TARGET_POP)
+        assert sel["selected"]["ev"] > 0
+        # never picks a -EV fly even if it has a higher POP
+        assert all(c["ev"] > 0 or c["pop"] <= sel["selected"]["pop"]
+                   for c in sel["scored"])
+
+    def test_selected_clears_rr_floor(self):
+        sel = select_width_by_pop(self._chain(), body=740.0, right="CALL",
+                                  expiry=EXPIRY, sigma=6.0, center=740.0, min_rr=1.0)
+        assert sel["selected"]["ratio"]["risk_reward"] >= 1.0
+
+    def test_rr_floor_blocks_capital_torching_wides(self):
+        # A tight floor keeps only the narrow, capital-efficient fly; loosening
+        # it lets the wide high-POP fly through. Guards against deep-ITM boxes.
+        chain = self._chain()
+        strict = select_width_by_pop(chain, body=740.0, right="CALL", expiry=EXPIRY,
+                                     sigma=6.0, center=740.0, min_rr=5.0)
+        loose = select_width_by_pop(chain, body=740.0, right="CALL", expiry=EXPIRY,
+                                    sigma=6.0, center=740.0, min_rr=1.0)
+        assert strict["selected"]["width"] == 5.0      # only 1:9 fly clears 1:5
+        assert loose["selected"]["width"] == 20.0      # widest +EV fly clears 1:1
+        assert loose["selected"]["pop"] > strict["selected"]["pop"]

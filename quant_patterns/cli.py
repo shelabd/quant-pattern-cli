@@ -2052,9 +2052,17 @@ def dashboard(ticker, event_type, days, lookback, top_n, bins, regime, target_da
 @cli.command()
 @click.argument("ticker")
 @click.option("--width", "-w", type=float, default=None,
-              help="Fixed wing width (disables the adaptive 5→3→2 ladder)")
+              help="Fixed wing width (disables width search; keeps R:R-ceiling check)")
+@click.option("--select", "select_mode", type=click.Choice(["pop", "payout"]),
+              default="pop", show_default=True,
+              help="Width objective: 'pop' searches for the highest "
+                   "probability-of-profit positive-EV fly; 'payout' walks the "
+                   "R:R ladder against the debit ceiling width/(min-rr+1)")
+@click.option("--target-pop", default=0.55, show_default=True,
+              help="Target probability of profit for --select pop (the engine "
+                   "maximizes POP among positive-EV flies; flags when below target)")
 @click.option("--min-rr", default=5.0, show_default=True,
-              help="Minimum structural risk:reward (sets the debit ceiling width/(rr+1))")
+              help="Minimum structural risk:reward in payout mode (debit ceiling width/(rr+1))")
 @click.option("--band", default=1.5, show_default=True,
               help="Pin search band as % from spot in the drift direction")
 @click.option("--min-dte", default=2, show_default=True, help="Minimum days to expiry")
@@ -2074,16 +2082,17 @@ def dashboard(ticker, event_type, days, lookback, top_n, bins, regime, target_da
 @click.option("--json", "as_json", is_flag=True,
               help="Emit the recommendation as JSON (for piping)")
 @common_options
-def fly(ticker, width, min_rr, band, min_dte, max_dte, account, expiry_str,
-        chain_source, log_entry, as_json, provider, verbose):
+def fly(ticker, width, select_mode, target_pop, min_rr, band, min_dte, max_dte,
+        account, expiry_str, chain_source, log_entry, as_json, provider, verbose):
     """
     Recommend a 3-Day Pin Fly: a 2-5 DTE butterfly bodied on the highest
-    open-interest pin strike near spot, targeting structural risk:reward
-    of at least 1:5.
+    open-interest pin strike near spot.
 
     Drift (5/20 EMA + 3-session momentum) picks the band direction and the
-    option right; the expiry with the heaviest pin OI wins; wing width
-    adapts 5→3→2 until the debit fits width/(min_rr+1). Skips or
+    option right; the expiry with the heaviest pin OI wins. Wing width is
+    chosen for probability of profit by default (--select pop: the widest
+    positive-EV fly that tends to actually pin), or for headline risk:reward
+    (--select payout: the 5→3→2 ladder against width/(min_rr+1)). Skips or
     half-sizes around CPI/PPI/FOMC/NFP prints inside the holding window.
 
     Output is analysis, not financial advice — no orders are placed.
@@ -2092,7 +2101,9 @@ def fly(ticker, width, min_rr, band, min_dte, max_dte, account, expiry_str,
 
       qpat fly SPY
 
-      qpat fly SPY --min-rr 15 --account 25000
+      qpat fly SPY --target-pop 0.6 --account 25000
+
+      qpat fly SPY --select payout --min-rr 15
 
       qpat fly QQQ -w 5 --expiry 2026-06-18
 
@@ -2107,10 +2118,14 @@ def fly(ticker, width, min_rr, band, min_dte, max_dte, account, expiry_str,
                        if expiry_str else None)
 
     if not as_json:
+        if width:
+            mode_note = f"Width: {width:g} (fixed) | Min R:R: 1:{min_rr:g}"
+        elif select_mode == "pop":
+            mode_note = f"Select: POP (target {target_pop:.0%}) | Width: searched"
+        else:
+            mode_note = f"Select: payout (min R:R 1:{min_rr:g}) | Width: adaptive 5→3→2"
         console.print(f"\n[bold cyan]⚡ 3-Day Pin Fly: {ticker}[/bold cyan]")
-        console.print(f"   Band: {band}% | DTE: {min_dte}-{max_dte} | Min R:R: 1:{min_rr:g}"
-                      + (f" | Width: {width:g} (fixed)" if width else " | Width: adaptive 5→3→2")
-                      + "\n")
+        console.print(f"   Band: {band}% | DTE: {min_dte}-{max_dte} | {mode_note}\n")
 
     try:
         rec = recommend_fly(
@@ -2123,6 +2138,8 @@ def fly(ticker, width, min_rr, band, min_dte, max_dte, account, expiry_str,
             account=account,
             expiry_override=expiry_override,
             chain_source=chain_source,
+            select=select_mode,
+            target_pop=target_pop,
         )
     except Exception as e:
         if as_json:

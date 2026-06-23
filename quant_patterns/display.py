@@ -1276,7 +1276,11 @@ def display_fly(rec) -> None:
     stats.add_column("Metric", style="dim", width=26)
     stats.add_column("Value", width=30)
 
-    rr_color = "green" if rec.risk_reward >= rec.min_rr else "yellow"
+    pop_mode = getattr(rec, "select_mode", "payout") == "pop"
+    if rec.max_debit_ceiling is None:
+        rr_color = "white"  # POP mode: R:R is informational, not the gate
+    else:
+        rr_color = "green" if rec.risk_reward >= rec.min_rr else "yellow"
     stats.add_row("Debit (per fly)", Text(f"${rec.debit * 100:.2f}", style="bold white"))
     stats.add_row("Max payout (per fly)", Text(f"${rec.max_profit * 100:.2f}", style="bold green"))
     stats.add_row("Risk : Reward", Text(f"1 : {rec.risk_reward:.1f}", style=f"bold {rr_color}"))
@@ -1306,9 +1310,10 @@ def display_fly(rec) -> None:
     stats.add_row("Suggested limit", Text(
         f"${rec.limit_price:.2f} per share (${rec.limit_price * 100:.2f} per fly)",
         style="bold cyan"))
-    stats.add_row("Debit ceiling", Text(
-        f"${rec.max_debit_ceiling:.2f} — fills above this VOID the trade",
-        style="bold red"))
+    if rec.max_debit_ceiling is not None:
+        stats.add_row("Debit ceiling", Text(
+            f"${rec.max_debit_ceiling:.2f} — fills above this VOID the trade",
+            style="bold red"))
     console.print(stats)
 
     # ── Sizing + verdict ────────────────────────────────────────────────
@@ -1322,7 +1327,12 @@ def display_fly(rec) -> None:
         sizing_text = f"Size: {lo:g}-{hi:g}% of account per fly"
     console.print(Text(f"  {sizing_text}", style="white"))
 
-    console.print(Text(f"\n  ✓ PASS — structural 1:{rec.risk_reward:.1f} at the mid", style="bold green"))
+    if pop_mode:
+        verdict_line = (f"\n  ✓ PASS — highest-POP positive-EV fly: POP {rec.prob_profit * 100:.0f}%, "
+                        f"EV ${rec.expected_value:+.0f}/fly (1:{rec.risk_reward:.1f} structural)")
+    else:
+        verdict_line = f"\n  ✓ PASS — structural 1:{rec.risk_reward:.1f} at the mid"
+    console.print(Text(verdict_line, style="bold green"))
     for w in rec.warnings:
         console.print(Text(f"  ⚠ {w}", style="yellow"))
 
