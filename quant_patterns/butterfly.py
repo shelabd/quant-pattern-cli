@@ -950,6 +950,26 @@ def recommend_fly(
             for k, v in em_fields.items():
                 setattr(rec, k, v)
             return rec
+        if not sel["reached_target"]:
+            # The best balanced +EV fly still falls short of the POP target —
+            # in this regime the expected move is too large for a high-POP pin
+            # fly, so log NO TRADE rather than recommend a sub-target one.
+            best = chosen
+            reason = (
+                f"best balanced fly reaches only POP {best['pop'] * 100:.0f}% "
+                f"(target {target_pop:.0%}) at width {best['width']:g} — the "
+                f"±{em['pct'] * 100:.1f}% expected move is too large for a "
+                f"high-POP fly at {dte} DTE"
+            )
+            rec = _no_trade(base, reason)
+            rec.width_attempts = sel["attempts"]
+            rec.body_oi = pin["total_oi"]
+            rec.band_rank = pin["oi_rank"]
+            rec.expiry_pin_oi = pin["concentration"]
+            rec.warnings = oi_warnings
+            for k, v in em_fields.items():
+                setattr(rec, k, v)
+            return rec
         width, debit, legs = chosen["width"], chosen["debit"], chosen["legs"]
         ratio = chosen["ratio"]
         attempts = sel["attempts"]

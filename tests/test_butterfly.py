@@ -511,6 +511,19 @@ class TestSelectWidthByPop:
         assert all(c["ev"] > 0 or c["pop"] <= sel["selected"]["pop"]
                    for c in sel["scored"])
 
+    def test_reached_target_flag_gates_on_pop(self):
+        # An unreachable target still returns a selection, but flags the miss
+        # so the orchestrator can downgrade it to NO TRADE.
+        miss = select_width_by_pop(self._chain(), body=740.0, right="CALL",
+                                   expiry=EXPIRY, sigma=6.0, center=740.0,
+                                   target_pop=0.99)
+        assert miss["selected"] is not None
+        assert miss["reached_target"] is False
+        hit = select_width_by_pop(self._chain(), body=740.0, right="CALL",
+                                  expiry=EXPIRY, sigma=6.0, center=740.0,
+                                  target_pop=0.50)
+        assert hit["reached_target"] is True
+
     def test_selected_clears_rr_floor(self):
         sel = select_width_by_pop(self._chain(), body=740.0, right="CALL",
                                   expiry=EXPIRY, sigma=6.0, center=740.0, min_rr=1.0)
