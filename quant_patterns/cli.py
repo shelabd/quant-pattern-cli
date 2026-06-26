@@ -2054,10 +2054,10 @@ def dashboard(ticker, event_type, days, lookback, top_n, bins, regime, target_da
 @click.option("--width", "-w", type=float, default=None,
               help="Fixed wing width (disables width search; keeps R:R-ceiling check)")
 @click.option("--select", "select_mode", type=click.Choice(["pop", "payout"]),
-              default="pop", show_default=True,
-              help="Width objective: 'pop' searches for the highest "
-                   "probability-of-profit positive-EV fly; 'payout' walks the "
-                   "R:R ladder against the debit ceiling width/(min-rr+1)")
+              default="payout", show_default=True,
+              help="Width objective: 'payout' walks the R:R ladder against the "
+                   "debit ceiling width/(min-rr+1); 'pop' searches for the "
+                   "highest probability-of-profit positive-EV fly instead")
 @click.option("--target-pop", default=0.55, show_default=True,
               help="Target probability of profit for --select pop (the engine "
                    "maximizes POP among positive-EV flies; flags when below target)")
@@ -2090,10 +2090,10 @@ def fly(ticker, width, select_mode, target_pop, min_rr, band, min_dte, max_dte,
 
     Drift (5/20 EMA + 3-session momentum) picks the band direction and the
     option right; the expiry with the heaviest pin OI wins. Wing width is
-    chosen for probability of profit by default (--select pop: the widest
-    positive-EV fly that tends to actually pin), or for headline risk:reward
-    (--select payout: the 5→3→2 ladder against width/(min_rr+1)). Skips or
-    half-sizes around CPI/PPI/FOMC/NFP prints inside the holding window.
+    chosen for headline risk:reward by default (--select payout: the 5→3→2
+    ladder against width/(min_rr+1), targeting 1:5), or for probability of
+    profit (--select pop: the widest positive-EV fly that tends to actually
+    pin). Skips or half-sizes around CPI/PPI/FOMC/NFP prints in the window.
 
     Output is analysis, not financial advice — no orders are placed.
 
@@ -2101,9 +2101,9 @@ def fly(ticker, width, select_mode, target_pop, min_rr, band, min_dte, max_dte,
 
       qpat fly SPY
 
-      qpat fly SPY --target-pop 0.6 --account 25000
+      qpat fly SPY --min-rr 15 --account 25000
 
-      qpat fly SPY --select payout --min-rr 15
+      qpat fly SPY --select pop --target-pop 0.6
 
       qpat fly QQQ -w 5 --expiry 2026-06-18
 

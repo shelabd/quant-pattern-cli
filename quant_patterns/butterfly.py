@@ -6,13 +6,15 @@ open-interest "pin" strike near spot. The engine detects price drift, scores
 strikes inside a directional band by gamma-weighted open interest, and selects
 the expiry whose pin OI concentration is highest.
 
-Wing-width selection has two modes. The default **POP mode** searches every
-symmetric width listed in the chain and picks the one that maximizes
-probability of profit among *positive-EV* flies — high-POP flies are wide
-(their tent covers more of the expected-move distribution), so this trades
-fat headline risk:reward for a fly that actually tends to pin. The legacy
-**payout mode** instead walks the adaptive ladder (5 → 3 → 2) until the debit
-fits the R:R ceiling `width / (min_rr + 1)`, maximizing headline risk:reward.
+Wing-width selection has two modes. The default **payout mode** walks the
+adaptive ladder (5 → 3 → 2) until the debit fits the R:R ceiling
+`width / (min_rr + 1)`, maximizing headline risk:reward (targeting 1:5).
+The optional **POP mode** instead searches every symmetric width listed in
+the chain and picks the one that maximizes probability of profit among
+*positive-EV* flies — high-POP flies are wide (their tent covers more of the
+expected-move distribution), so this trades fat headline risk:reward for a
+fly that actually tends to pin, and logs NO TRADE when the best fly is below
+its POP target.
 
 Both modes rest on an expected-move model: IV-implied diffusion ⊕ a
 macro-event vol bump for FOMC/CPI/PPI/NFP landing in the holding window. It
@@ -140,7 +142,7 @@ class FlyRecommendation:
     sizing_pct: tuple[float, float] = BASE_SIZING_PCT
     account_size: Optional[float] = None
     min_rr: float = DEFAULT_MIN_RR
-    select_mode: str = "pop"               # "pop" | "payout" | "fixed"
+    select_mode: str = "payout"            # "payout" | "pop" | "fixed"
     target_pop: float = DEFAULT_TARGET_POP
     data_source: str = "Yahoo Finance"
     # Expected-move / macro-uncertainty model (informational; never alters
@@ -807,7 +809,7 @@ def recommend_fly(
     expiry_override: Optional[date] = None,
     today: Optional[date] = None,
     chain_source: str = "auto",
-    select: str = "pop",
+    select: str = "payout",
     target_pop: float = DEFAULT_TARGET_POP,
 ) -> FlyRecommendation:
     """End-to-end pin-fly recommendation against live data.
