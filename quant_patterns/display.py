@@ -109,11 +109,12 @@ def _pct_color(val: float) -> str:
 
 
 def _score_color(score: float) -> str:
-    if score >= 0.8:
+    # Mirrors SimilarityResult.score_label's null-calibrated thresholds.
+    if score >= 0.75:
         return "bright_green"
-    elif score >= 0.6:
+    elif score >= 0.55:
         return "green"
-    elif score >= 0.4:
+    elif score >= 0.35:
         return "yellow"
     else:
         return "red"
@@ -1203,12 +1204,24 @@ def display_regime_conditional_winrates(ticker: str, category: str, regime_winra
 
 # ── Pin Butterfly Ticket ─────────────────────────────────────────────────────
 
+def _em_source_parts(rec) -> list:
+    """What drives the expected move: ATM IV, plus any macro events — tagged
+    "floor" when the event floor exceeds the IV diffusion (else the event is
+    already priced into IV)."""
+    parts = [f"IV {rec.atm_iv * 100:.0f}%"] if rec.atm_iv is not None else []
+    if rec.event_addons:
+        names = ", ".join(a["name"].split(" ")[0] for a in rec.event_addons)
+        floor_binds = (rec.em_diffusion is not None
+                       and rec.expected_move_dollars is not None
+                       and rec.expected_move_dollars > rec.em_diffusion + 1e-9)
+        parts.append(f"{names} floor" if floor_binds else f"{names} in IV")
+    return parts
+
+
 def _expected_move_line(rec) -> str:
     """One-line expected-move summary: ±%, ±$, and what drives it."""
-    src = [f"IV {rec.atm_iv * 100:.0f}%"] if rec.atm_iv is not None else []
-    if rec.event_addons:
-        src.append(", ".join(a["name"].split(" ")[0] for a in rec.event_addons))
-    suffix = f" — {' ⊕ '.join(src)}" if src else ""
+    src = _em_source_parts(rec)
+    suffix = f" — {' · '.join(src)}" if src else ""
     return (f"Expected move (1σ): ±{rec.expected_move_pct * 100:.1f}% "
             f"(±${rec.expected_move_dollars:.2f}){suffix}")
 
@@ -1289,11 +1302,10 @@ def display_fly(rec) -> None:
     # Expected-move / uncertainty (informational)
     if rec.expected_move_pct is not None:
         em_color = "yellow" if rec.expected_move_dollars > (rec.selected_width - rec.debit) else "white"
+        src = _em_source_parts(rec)
         stats.add_row("Expected move (1σ)", Text(
             f"±{rec.expected_move_pct * 100:.1f}% (±${rec.expected_move_dollars:.2f})"
-            + (f"  [IV {rec.atm_iv * 100:.0f}%"
-               + (" ⊕ " + ", ".join(a["name"].split(" ")[0] for a in rec.event_addons)
-                  if rec.event_addons else "") + "]"),
+            + (f"  [{' · '.join(src)}]" if src else ""),
             style=em_color))
     if rec.prob_profit is not None:
         pop = rec.prob_profit
