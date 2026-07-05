@@ -76,6 +76,14 @@ class TestWalkForwardEvents:
         assert all(o.hit for o in outcomes)
         assert all(o.direction == "bullish" for o in outcomes)
 
+    def test_neutral_priors_emit_nothing(self):
+        # Priors where the mean (dragged up by one outlier) and the win
+        # majority disagree are neutral — the backtester must abstain
+        # rather than score a signal qpat would not have given.
+        rets = [10.0, -1.0, -1.0, -1.0, -1.0, 2.0]
+        outcomes = walk_forward_event_signals(_event_returns(rets), min_history=5)
+        assert outcomes == []
+
     def test_bearish_priors_bearish_signal(self):
         rets = [-1.0] * 6 + [-0.5]
         outcomes = walk_forward_event_signals(_event_returns(rets), min_history=5)

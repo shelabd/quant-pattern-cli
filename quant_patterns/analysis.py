@@ -490,6 +490,11 @@ class SignalStats:
     confidence is the Wilson lower bound of the directional win rate — it
     shrinks with sample size, unlike the raw win rate. p_value tests the win
     count against the baseline win rate (or a fair coin without a baseline).
+
+    direction is "neutral" when there are no measurable returns OR when the
+    mean return and the win-count majority disagree (e.g. one outlier win
+    among mostly-down events) — there is no coherent direction to test, so
+    confidence is 0 and p_value is 1.
     """
     direction: str           # "bullish" | "bearish" | "neutral"
     confidence: float        # 0-1, Wilson lower bound of directional win rate
@@ -553,7 +558,23 @@ def signal_stats_from_returns(
             n=0, wins=0, win_rate=0.0, p_value=1.0, baseline=baseline,
         )
 
-    direction = "bullish" if edge > 0 else "bearish"
+    # Direction requires the mean return and the win-count majority to agree:
+    # a lone outlier win among mostly-down events (edge > 0, wins < n/2) is
+    # not coherent directional evidence, and the binomial test below — which
+    # counts wins in the called direction — would contradict the mean-based
+    # call. Disagreement or an exact tie on either measure is "neutral", which
+    # downstream consumers (backtester, forecast) treat as abstain.
+    mean_dir = "bullish" if edge > 0 else "bearish" if edge < 0 else "neutral"
+    majority_dir = ("bullish" if 2 * wins > n
+                    else "bearish" if 2 * wins < n else "neutral")
+    if mean_dir == "neutral" or majority_dir == "neutral" or mean_dir != majority_dir:
+        return SignalStats(
+            direction="neutral", confidence=0.0, edge_pct=edge,
+            n=n, wins=wins, win_rate=win_rate, p_value=1.0, baseline=baseline,
+            excess_edge_pct=(edge - baseline.mean_return_pct) if baseline else None,
+        )
+
+    direction = mean_dir
     base_p = baseline.win_rate if baseline else 0.5
     base_p = min(0.999, max(0.001, base_p))
 

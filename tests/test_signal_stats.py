@@ -113,6 +113,25 @@ class TestComputeSignalStats:
         assert stats.direction == "bearish"
         assert 0 < stats.confidence < 1
 
+    def test_outlier_win_among_losses_is_neutral(self):
+        """Mean up but majority down: one +10% outlier against four small
+        losses is not coherent directional evidence — must abstain, not
+        call 'bullish' with a contradictory win count."""
+        stats = compute_signal_stats(_make_profile([10.0, -1.0, -1.0, -1.0, -1.0]))
+        assert stats.direction == "neutral"
+        assert stats.confidence == 0.0
+        assert stats.p_value == 1.0
+        assert stats.edge_pct > 0  # the raw mean is still reported
+
+    def test_outlier_loss_among_wins_is_neutral(self):
+        stats = compute_signal_stats(_make_profile([-10.0, 1.0, 1.0, 1.0, 1.0]))
+        assert stats.direction == "neutral"
+
+    def test_split_wins_is_neutral(self):
+        """Exactly half wins: no majority, no direction."""
+        stats = compute_signal_stats(_make_profile([2.0, 1.0, -1.0, -0.5]))
+        assert stats.direction == "neutral"
+
     def test_small_sample_low_confidence(self):
         """The old raw win rate said 70% on 7/10; Wilson must shrink it."""
         rets = [1.0] * 7 + [-1.0] * 3
