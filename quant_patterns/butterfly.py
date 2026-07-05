@@ -861,13 +861,15 @@ def recommend_fly(
     The only function in this module that touches the network. OHLCV (for
     drift and spot) goes through data.py's provider; option chains go
     through options_data's provider layer — Massive when an API key is
-    configured, else CBOE's free delayed feed. A chain-source failure
-    degrades to yfinance with a warning instead of erroring.
+    configured, else CBOE's free delayed feed. A chain-source failure raises
+    ChainSourceError instead of silently degrading to yfinance (whose chains
+    lack OI on fresh weeklies); pass chain_source="yfinance" to opt into the
+    degraded source explicitly.
     """
     from datetime import timedelta
     from .data import get_provider
     from .events import EventCatalog
-    from .options_data import fetch_chains_with_fallback, get_options_provider
+    from .options_data import fetch_chains, get_options_provider
 
     ticker = ticker.upper()
     today = today or date.today()
@@ -889,7 +891,7 @@ def recommend_fly(
     else:
         window = (today + timedelta(days=min_dte), today + timedelta(days=max_dte))
 
-    oprov, candidates, source_warnings = fetch_chains_with_fallback(
+    oprov, candidates, source_warnings = fetch_chains(
         get_options_provider(chain_source), ticker, *window)
 
     base = dict(

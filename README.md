@@ -112,9 +112,12 @@ estimate). Quotes are 15-min delayed; OI is as of last close, like every
 source. Index tickers (SPX, XSP, VIX, RUT) work too. With a
 [Massive](https://massive.com) API key configured (the rebranded
 Polygon.io; options snapshots require a paid plan), `qpat fly`
-automatically upgrades to OPRA-consolidated NBBO snapshots. Any
-chain-source failure degrades to yfinance with a warning rather than
-erroring.
+automatically upgrades to OPRA-consolidated NBBO snapshots. A
+chain-source failure **errors out rather than silently degrading**:
+yfinance chains report zero open interest on fresh weeklies, which would
+corrupt OI-weighted pin scoring while looking authoritative. Pass
+`--chain-source yfinance` to accept the degraded source explicitly (the
+ticket then carries a data-quality warning).
 
 ```bash
 qpat fly SPY                                  # CBOE free feed, zero setup

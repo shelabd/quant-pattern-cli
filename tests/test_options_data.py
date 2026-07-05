@@ -23,7 +23,8 @@ from quant_patterns.options_data import (
     YFinanceOptionsProvider,
     _sides_to_frame,
     cboe_chain_rows,
-    fetch_chains_with_fallback,
+    ChainSourceError,
+    fetch_chains,
     get_massive_api_key,
     get_options_provider,
     massive_chain_frame,
@@ -353,27 +354,32 @@ class _StubProvider(OptionsChainProvider):
         return self.result or []
 
 
-class TestFallback:
+class TestFetchChains:
     def test_success_passes_through(self):
         chains = [(EXPIRY, massive_chain_frame([contract("call", 100)]))]
         prov = _StubProvider(result=chains, label="Massive (OPRA)")
-        used, got, warnings = fetch_chains_with_fallback(prov, "SPY", EXPIRY, EXPIRY)
+        used, got, warnings = fetch_chains(prov, "SPY", EXPIRY, EXPIRY)
         assert used is prov and got is chains and warnings == []
 
-    def test_paid_provider_failure_falls_back_to_yfinance(self, monkeypatch):
-        fallback_chains = [(EXPIRY, massive_chain_frame([contract("put", 100)]))]
-        monkeypatch.setattr(YFinanceOptionsProvider, "get_chains_window",
-                            lambda self, t, s, e: fallback_chains)
+    def test_provider_failure_raises_no_silent_fallback(self):
+        # A CBOE/Massive failure must fail loudly: yfinance chains lack OI
+        # on fresh weeklies and would corrupt pin scoring invisibly.
         prov = _StubProvider(error=MassiveAPIError("boom"), label="Massive (OPRA)")
+        with pytest.raises(ChainSourceError, match="chain-source yfinance"):
+            fetch_chains(prov, "SPY", EXPIRY, EXPIRY)
 
-        used, got, warnings = fetch_chains_with_fallback(prov, "SPY", EXPIRY, EXPIRY)
+    def test_explicit_yfinance_carries_degraded_warning(self, monkeypatch):
+        chains = [(EXPIRY, massive_chain_frame([contract("put", 100)]))]
+        monkeypatch.setattr(YFinanceOptionsProvider, "get_chains_window",
+                            lambda self, t, s, e: chains)
+        used, got, warnings = fetch_chains(YFinanceOptionsProvider(), "SPY", EXPIRY, EXPIRY)
         assert isinstance(used, YFinanceOptionsProvider)
-        assert got is fallback_chains
-        assert len(warnings) == 1 and "fell back" in warnings[0]
+        assert got is chains
+        assert len(warnings) == 1 and "degraded" in warnings[0]
 
     def test_yfinance_failure_propagates(self, monkeypatch):
         monkeypatch.setattr(
             YFinanceOptionsProvider, "get_chains_window",
             lambda self, t, s, e: (_ for _ in ()).throw(RuntimeError("no net")))
         with pytest.raises(RuntimeError, match="no net"):
-            fetch_chains_with_fallback(YFinanceOptionsProvider(), "SPY", EXPIRY, EXPIRY)
+            fetch_chains(YFinanceOptionsProvider(), "SPY", EXPIRY, EXPIRY)

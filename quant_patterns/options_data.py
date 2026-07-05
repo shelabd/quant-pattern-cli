@@ -320,20 +320,41 @@ def get_options_provider(source: str = "auto") -> OptionsChainProvider:
     return MassiveOptionsProvider(key) if key else CboeOptionsProvider()
 
 
-def fetch_chains_with_fallback(
+class ChainSourceError(RuntimeError):
+    """A chain provider failed and qpat refuses to silently degrade."""
+
+
+def fetch_chains(
     provider: OptionsChainProvider, ticker: str, start: date, end: date
 ) -> tuple[OptionsChainProvider, list[tuple[date, pd.DataFrame]], list[str]]:
-    """Fetch chains, degrading to yfinance when a paid provider errors.
+    """Fetch chains from the resolved provider — no silent fallback.
 
-    Returns (provider actually used, chains, warnings). yfinance errors
-    propagate — there is nothing left to fall back to.
+    A CBOE/Massive failure raises :class:`ChainSourceError` instead of
+    degrading to yfinance: yfinance chains report zero/absent open interest
+    on fresh weeklies and 0/0 quotes after hours, which corrupts OI-weighted
+    pin scoring while the output still looks authoritative. Running with
+    ``--chain-source yfinance`` opts into the degraded source explicitly —
+    it then carries a data-quality warning on the recommendation.
+
+    Returns (provider, chains, warnings).
     """
+    warnings: list[str] = []
+    if isinstance(provider, YFinanceOptionsProvider):
+        warnings.append(
+            "yfinance chain source: OI is often zero/absent on fresh weeklies "
+            "and quotes go 0/0 after hours — pin scoring may be degraded. "
+            "Verify the OI wall on your broker before trusting this pin."
+        )
     try:
-        return provider, provider.get_chains_window(ticker, start, end), []
+        return provider, provider.get_chains_window(ticker, start, end), warnings
     except Exception as e:
         if isinstance(provider, YFinanceOptionsProvider):
             raise
-        logger.warning(f"{provider.name()} chain fetch failed ({e}); falling back to yfinance")
-        fallback = YFinanceOptionsProvider()
-        warnings = [f"{provider.name()} chain fetch failed ({e}) — fell back to {fallback.name()}."]
-        return fallback, fallback.get_chains_window(ticker, start, end), warnings
+        logger.warning(f"{provider.name()} chain fetch failed ({e}); not falling back")
+        raise ChainSourceError(
+            f"{provider.name()} chain fetch failed: {e}. Not falling back to "
+            "yfinance automatically — its chains report zero open interest on "
+            "fresh weeklies, which silently corrupts pin scoring. Retry later, "
+            "or rerun with --chain-source yfinance to accept degraded data "
+            "explicitly."
+        ) from e
