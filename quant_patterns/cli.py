@@ -2169,6 +2169,103 @@ def fly(ticker, width, select_mode, target_pop, min_rr, band, min_dte, max_dte,
             console.print(f"  [dim]{msg}[/dim]\n")
 
 
+# ── SCALP command ───────────────────────────────────────────────────────────────
+
+SCALP_LOG_PATH = Path.home() / ".qpat" / "scalp_journal.jsonl"
+
+
+@cli.command()
+@click.argument("ticker", default="SPY")
+@click.option("--json", "as_json", is_flag=True, help="Emit levels as JSON")
+@click.option("--notify", "do_notify", is_flag=True,
+              help="Send levels to Telegram (qpat config set telegram-bot-token / telegram-chat-id)")
+@click.option("--cron", is_flag=True,
+              help="Scheduler mode: exit silently when the US market is closed")
+@click.option("--log/--no-log", "do_log", default=True,
+              help="Append each snapshot to ~/.qpat/scalp_journal.jsonl")
+def scalp(ticker, as_json, do_notify, cron, do_log):
+    """Intraday scalp floor & ceiling for TICKER (default SPY).
+
+    Levels combine nearest-expiry OI walls, the ATM-IV expected move over
+    the REMAINING session, and intraday price structure (VWAP, opening
+    range, session and prior-day levels). Meant to run every 30 minutes
+    during the session via launchd with --notify --cron.
+    """
+    from .butterfly import atm_iv
+    from .data import YFinanceProvider
+    from .options_data import fetch_chains, get_options_provider
+    from .scalp import ET, compute_scalp_levels, format_message, is_market_open
+
+    ticker = ticker.upper()
+    now_et = datetime.now(ET)
+    if cron and not is_market_open(now_et):
+        return
+
+    warnings: list[str] = []
+    try:
+        bars = YFinanceProvider().get_intraday_ohlcv(ticker)
+    except Exception as e:
+        if cron:
+            click.echo(f"scalp: intraday fetch failed: {e}", err=True)
+            sys.exit(1)
+        console.print(f"[red]Intraday data error: {e}[/red]")
+        sys.exit(1)
+
+    sessions = sorted(set(bars.index.date))
+    last_session = sessions[-1]
+    today_bars = bars[bars.index.date == last_session]
+    prior_bars = bars[bars.index.date == sessions[-2]] if len(sessions) > 1 else None
+    if last_session != now_et.date():
+        if cron:
+            return  # holiday — no session today, stay silent
+        warnings.append(f"market closed — levels from last session ({last_session})")
+    spot = float(today_bars["Close"].iloc[-1])
+
+    chain = None
+    chain_expiry = None
+    iv = None
+    try:
+        _, candidates, source_warnings = fetch_chains(
+            get_options_provider("auto"), ticker,
+            now_et.date(), now_et.date() + timedelta(days=4))
+        if candidates:
+            expiry, chain = candidates[0]  # nearest expiry = today's 0DTE when listed
+            chain_expiry = expiry.isoformat()
+            iv = atm_iv(chain, spot)
+        warnings.extend(source_warnings)
+    except Exception as e:
+        # Unlike `fly`, the chain is one of several level sources here —
+        # degrade to price action + IV-less levels, but say so prominently.
+        warnings.append(f"OI walls unavailable ({e}) — levels from price action + prior session only")
+
+    levels = compute_scalp_levels(
+        ticker, spot, now_et, today_bars, prior_bars, chain, iv,
+        chain_expiry=chain_expiry, warnings=warnings,
+    )
+
+    if do_log:
+        SCALP_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with SCALP_LOG_PATH.open("a") as f:
+            f.write(json.dumps(levels.to_dict()) + "\n")
+
+    if as_json:
+        click.echo(json.dumps(levels.to_dict(), indent=2))
+    elif not cron:
+        from .display import display_scalp
+        display_scalp(levels)
+
+    if do_notify:
+        from .notify import TelegramError, send_telegram
+        try:
+            send_telegram(format_message(levels))
+        except TelegramError as e:
+            if cron:
+                click.echo(f"scalp: {e}", err=True)
+            else:
+                console.print(f"[red]{e}[/red]")
+            sys.exit(1)
+
+
 # ── JOURNAL command ─────────────────────────────────────────────────────────────
 
 @cli.command()

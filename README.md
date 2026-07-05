@@ -158,6 +158,30 @@ qpat journal              # score everything that has expired
 qpat journal -t SPY --json | jq .summary
 ```
 
+### `qpat scalp [TICKER]`
+**Intraday scalp floor & ceiling** (default SPY). Three families of evidence,
+clustered into one actionable level per side: nearest-expiry **OI walls**
+(biggest put-OI strike below spot / call-OI strike above, plus the
+gamma-weighted "magnet"), the **ATM-IV expected move over the remaining
+session** (shrinks into the close), and **price structure** (VWAP, opening
+range, session and prior-day high/low/close). Candidates within 0.15% merge;
+a cluster containing an OI wall snaps to the wall's strike. Every snapshot
+appends to `~/.qpat/scalp_journal.jsonl`. Designed to run every 30 minutes
+during the session via launchd with `--notify --cron`:
+
+| Flag | Description |
+|------|-------------|
+| `--notify` | Send the levels to Telegram (`qpat config set telegram-bot-token` / `telegram-chat-id`) |
+| `--cron` | Scheduler mode: exit silently when the US market is closed |
+| `--json` | Machine-readable output |
+| `--no-log` | Skip the jsonl snapshot log |
+
+```bash
+qpat scalp                    # SPY levels right now
+qpat scalp QQQ --json
+qpat scalp SPY --notify --cron   # what the 30-min launchd job runs
+```
+
 ### `qpat sr TICKER`
 Support & resistance detection using local extrema clustering. Shows touch count and strength.
 

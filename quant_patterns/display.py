@@ -1353,6 +1353,43 @@ def display_fly(rec) -> None:
     console.print()
 
 
+# ── Scalp Levels ─────────────────────────────────────────────────────────────
+
+def display_scalp(lv) -> None:
+    """Render intraday scalp floor/ceiling with contributing sources."""
+    console.print(Rule(f"[bold cyan]⚡ {lv.ticker} Scalp Levels — "
+                       f"{lv.asof.strftime('%H:%M')} ET"))
+    body = Table(box=box.SIMPLE, show_header=False, pad_edge=False)
+    body.add_column(justify="right", style="bold")
+    body.add_column()
+    spot_line = f"{lv.spot:.2f}"
+    if lv.vwap is not None:
+        rel = "above" if lv.spot >= lv.vwap else "below"
+        spot_line += f"   (VWAP {lv.vwap:.2f}, spot {rel})"
+    body.add_row("Spot", spot_line)
+    if lv.ceiling is not None:
+        body.add_row(Text("Ceiling", style="bold red"),
+                     Text(f"{lv.ceiling:.2f}  ", style="bold red")
+                     + Text(", ".join(lv.ceiling_sources[:4]), style="dim"))
+    if lv.floor is not None:
+        body.add_row(Text("Floor", style="bold green"),
+                     Text(f"{lv.floor:.2f}  ", style="bold green")
+                     + Text(", ".join(lv.floor_sources[:4]), style="dim"))
+    if lv.magnet is not None:
+        body.add_row("Magnet", f"{lv.magnet:g}   [dim]{lv.magnet_detail}[/dim]")
+    if lv.sigma_remaining:
+        body.add_row("1σ left", f"±{lv.sigma_remaining:.2f} "
+                     f"[dim]({lv.minutes_left}m to close, "
+                     f"IV {lv.atm_iv * 100:.0f}%)[/dim]" if lv.atm_iv else
+                     f"±{lv.sigma_remaining:.2f}")
+    console.print(Panel(body, border_style="cyan"))
+    for w in lv.warnings:
+        console.print(f"  [yellow]⚠ {w}[/yellow]")
+    console.print(Text("  OI as of last close. Analysis only — not financial advice.",
+                       style="dim"))
+    console.print()
+
+
 # ── Fly Forward-Test Journal ─────────────────────────────────────────────────
 
 def display_journal(scored: list, pending: list, stats: dict) -> None:

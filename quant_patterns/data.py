@@ -75,6 +75,22 @@ class YFinanceProvider(DataProvider):
         self._cache[cache_key] = df
         return df.copy()
 
+    def get_intraday_ohlcv(self, ticker: str, interval: str = "5m",
+                           days: int = 2) -> pd.DataFrame:
+        """Recent intraday bars (regular session only), tz-aware ET index.
+
+        Used by `qpat scalp` — today's bars for VWAP/opening range plus the
+        prior session for its high/low/close. Not cached: intraday data goes
+        stale within minutes.
+        """
+        tk = yf.Ticker(ticker)
+        df = tk.history(period=f"{days}d", interval=interval,
+                        auto_adjust=True, prepost=False)
+        if df.empty:
+            raise ValueError(f"No intraday data returned for {ticker}")
+        df.index = pd.to_datetime(df.index).tz_convert("America/New_York")
+        return df[["Open", "High", "Low", "Close", "Volume"]].copy()
+
 
 class IBKRProvider(DataProvider):
     """
