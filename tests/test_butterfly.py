@@ -411,10 +411,18 @@ class TestExpectedMove:
         assert em["pct"] == pytest.approx(manual / 750.0)
         assert em["event"] == 0.0
 
-    def test_event_widens_band(self):
+    def test_event_priced_in_iv_does_not_add(self):
+        # A healthy ATM IV already carries the event's variance — the macro
+        # component is a floor, so it must NOT widen the band on top of IV.
         base = expected_move(750.0, 0.20, dte=4, event_pct=0.0)["total"]
-        bumped = expected_move(750.0, 0.20, dte=4, event_pct=0.011)["total"]
-        assert bumped > base
+        same = expected_move(750.0, 0.20, dte=4, event_pct=0.011)["total"]
+        assert same == pytest.approx(base)
+
+    def test_event_floor_binds_when_iv_understates(self):
+        # Near-zero IV (stale/missing chain vol): the macro floor takes over.
+        em = expected_move(750.0, 0.01, dte=1, event_pct=0.011)
+        assert em["total"] == pytest.approx(750.0 * 0.011)
+        assert em["total"] > em["diffusion"]
 
 
 class TestProbInProfit:

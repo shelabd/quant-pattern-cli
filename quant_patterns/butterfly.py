@@ -73,8 +73,11 @@ BASE_SIZING_PCT = (0.5, 1.0)  # % of account per fly (low, high)
 
 # Forward 1-sigma move (as a fraction of spot) a scheduled macro print
 # typically injects on its release day. Heuristic, drawn from the rough
-# historical one-day SPX reaction to each release; added in quadrature to the
-# IV-implied diffusion so the expected-move band widens around macro events.
+# historical one-day SPX reaction to each release. Used as a FLOOR on the
+# expected move, not an additive bump: a chain whose expiry spans the event
+# already carries the event's variance in its ATM IV, so adding these on top
+# double-counts. The floor only binds when IV understates a known print
+# (missing/stale IV falling back to DEFAULT_IV_FALLBACK, zero-DTE edge cases).
 # Only events landing strictly AFTER today count (an already-printed event is
 # behind us for a forward trade). Tune freely — these are not market-implied.
 EVENT_VOL_ADDON: dict[str, float] = {
@@ -501,7 +504,9 @@ def event_vol_addon(events, today: date, expiry: date) -> tuple[float, list[dict
     event landing strictly after ``today`` and on/before ``expiry``. An event
     dated today is treated as already reflected in spot/IV (its move is behind
     a forward trade), so it adds no forward uncertainty. Unknown categories are
-    ignored. Returns ``(addon_pct, breakdown)``.
+    ignored. The result is a *floor* on the expected move (see
+    :func:`expected_move`), not an additive term — the chain's IV already
+    prices scheduled events. Returns ``(addon_pct, breakdown)``.
     """
     breakdown: list[dict] = []
     var = 0.0
@@ -519,14 +524,18 @@ def event_vol_addon(events, today: date, expiry: date) -> tuple[float, list[dict
 def expected_move(spot: float, iv: float, dte: int, event_pct: float = 0.0) -> dict:
     """1-sigma expected move to expiry in underlying points.
 
-    Combines the IV-implied diffusion ``S·IV·sqrt(DTE/365)`` with a macro-event
-    component ``S·event_pct`` in quadrature. Returns ``{diffusion, event,
-    total, pct}`` (pct = total / spot).
+    The IV-implied diffusion ``S·IV·sqrt(DTE/365)`` is the primary estimate:
+    a chain spanning a scheduled macro event already prices that event in its
+    ATM IV, so the macro component ``S·event_pct`` acts only as a *floor* —
+    ``total = max(diffusion, event)`` — binding when IV understates a known
+    print (no usable IV, stale fallback vol, zero-DTE). Adding the two in
+    quadrature would count the event's variance twice. Returns ``{diffusion,
+    event, total, pct}`` (pct = total / spot).
     """
     t = max(dte, 0) / 365.0
     diffusion = spot * max(iv, 0.0) * math.sqrt(t) if t > 0 else 0.0
     event = spot * max(event_pct, 0.0)
-    total = math.sqrt(diffusion * diffusion + event * event)
+    total = max(diffusion, event)
     return {
         "diffusion": diffusion,
         "event": event,
