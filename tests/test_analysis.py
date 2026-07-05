@@ -90,7 +90,9 @@ class TestCompareWindows:
         w2 = _make_normalized_window(down)
         result = compare_windows(w1, w2, "Test", date(2024, 1, 8))
         assert result.correlation < 0
-        assert result.composite_score < 0.4
+        # Re-centered scoring: a perfect mirror earns 0 on every shape metric
+        # and can only collect the small vol-ratio term.
+        assert result.composite_score < 0.15
 
     def test_result_fields(self):
         values = [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110]
@@ -104,13 +106,14 @@ class TestCompareWindows:
         assert result.dtw_distance >= 0
 
     def test_score_label_thresholds(self):
-        r = SimilarityResult("", date.today(), 0, 0, 0, 0.85, 0, 0)
+        # Null-calibrated boundaries: 0.75 / 0.55 / 0.35 (see analysis.py).
+        r = SimilarityResult("", date.today(), 0, 0, 0, 0.75, 0, 0)
         assert r.score_label == "Very Similar"
-        r.composite_score = 0.65
+        r.composite_score = 0.55
         assert r.score_label == "Similar"
-        r.composite_score = 0.45
+        r.composite_score = 0.35
         assert r.score_label == "Moderate"
-        r.composite_score = 0.2
+        r.composite_score = 0.34
         assert r.score_label == "Weak"
 
     def test_short_series_returns_zero_score(self):

@@ -93,7 +93,7 @@ def get_data_provider(provider_name: str) -> DataProvider:
 
 
 # ── Forecast tuning constants ─────────────────────────────────────────────────
-FORECAST_MIN_SCORE = 0.4
+FORECAST_MIN_SCORE = 0.35  # null-calibrated "Moderate" floor (see analysis.py)
 FORECAST_MIN_MATCHES = 2
 FORECAST_FALLBACK_N = 3
 FORECAST_CONF_DECAY = 0.05

@@ -50,16 +50,16 @@ Measures linear co-movement between two series.
 
 - **Implementation:** `scipy.stats.pearsonr(target, historical)`
 - **Raw range:** [-1, 1]
-- **Score conversion:** `score = (correlation + 1) / 2` → maps to [0, 1]
-- **Interpretation:** 1.0 = perfectly correlated shapes, 0.5 = uncorrelated, 0.0 = perfectly anti-correlated
+- **Score conversion:** `score = max(0, correlation)` — independent windows have `E[corr] = 0`, so uncorrelated pairs score ~0 and anti-correlation (anti-similarity) clamps to 0 rather than earning credit
+- **Interpretation:** 1.0 = perfectly correlated shapes, ~0 = unrelated or opposite
 
 ### 2. Euclidean Distance
 
 Measures point-by-point magnitude difference between series.
 
 - **Formula:** `distance = scipy.spatial.distance.euclidean(target, historical) / sqrt(length)`
-- **Score conversion:** `score = max(0, 1 - distance / 10)`
-- **Interpretation:** Division by `sqrt(length)` normalizes for window size. Score of 1.0 = identical series, decaying toward 0 as distance grows.
+- **Score conversion:** `score = max(0, 1 - distance / rms_dispersion)` where `rms_dispersion = sqrt(std_target² + std_hist²)`
+- **Interpretation:** Division by `sqrt(length)` normalizes for window size; the RMS dispersion is the natural distance scale of two *independent* series, so unrelated windows land at or above it and clamp to 0. Score of 1.0 = identical series.
 
 ### 3. Dynamic Time Warping (DTW)
 
@@ -71,8 +71,8 @@ Measures shape similarity allowing for temporal misalignment. Captures patterns 
   dtw[i,j] = cost + min(dtw[i-1,j], dtw[i,j-1], dtw[i-1,j-1])
   ```
 - **Normalization:** `dtw_norm = dtw_distance / length`
-- **Score conversion:** `score = max(0, 1 - dtw_norm / 10)`
-- **Interpretation:** Allows elastic alignment — two series with similar shape but different timing still score well.
+- **Score conversion:** `score = max(0, 1 - dtw_norm / (DTW_NULL_FACTOR * rms_dispersion))` with `DTW_NULL_FACTOR = 1.15`, the Monte-Carlo median of banded-DTW/RMS-dispersion for independent random-walk windows (the band lets DTW warp below the raw distance, so its null sits below the Euclidean one)
+- **Interpretation:** Allows elastic alignment — two series with similar shape but different timing still score well; unrelated windows score ~0.
 
 ### 4. Direction Match
 
@@ -82,16 +82,17 @@ Percentage of days where both series moved in the same direction (up/down).
   ```
   target_diff = diff(target)
   hist_diff = diff(historical)
-  score = mean(sign(target_diff) == sign(hist_diff))
+  match = mean(sign(target_diff) == sign(hist_diff))
+  score = max(0, 2 * match - 1)
   ```
 - **Range:** [0, 1]
-- **Interpretation:** 1.0 = every day moved the same direction. Ignores magnitude, focuses purely on directional agreement.
+- **Interpretation:** Random windows agree on ~50% of days, so the raw match rate is re-centered: 50% agreement scores 0, 100% scores 1. Ignores magnitude, focuses purely on directional agreement.
 
 ### 5. Volatility Ratio
 
 Symmetric measure of how similar the two series' volatilities are.
 
-- **Formula:** `ratio = min(std_target, std_hist) / max(std_target, std_hist)`
+- **Formula:** `ratio = min(std_target, std_hist) / max(std_target, std_hist)`, then `score = max(0, (ratio - 0.60) / 0.40)` — 0.60 is the Monte-Carlo mean ratio for independent windows drawn from mixed vol regimes
 - **Range:** [0, 1]
 - **Interpretation:** 1.0 = identical volatility. Penalizes matches where one period was much more volatile than the other.
 
@@ -110,17 +111,27 @@ The five metrics are combined into a single score using fixed weights:
 | Volatility Ratio | 0.10 | Regime similarity check |
 
 ```
-composite = 0.30 * corr + 0.20 * euclidean + 0.20 * dtw + 0.20 * direction + 0.10 * volatility
+composite = 0.30 * corr_score + 0.20 * euc_score + 0.20 * dtw_score + 0.20 * dir_score + 0.10 * vol_score
 ```
+
+Every metric is re-centered on its expectation for **independent random-walk
+windows** (see each metric's score conversion above), so pure noise scores
+near 0 instead of inheriting a deterministic floor. Monte-Carlo null of the
+composite (window lengths 10–21, mixed vol regimes): mean ≈ 0.15, p90 ≈ 0.38.
+Residual null variance comes mostly from spurious correlation between random
+walks, which re-centering cannot remove — treat scores below ~0.35 as noise.
 
 ### Score Labels
 
+Thresholds are anchored to the Monte-Carlo composite of correlated random
+walks: ~0.35 ≈ ρ 0.5, ~0.55 ≈ ρ 0.8, ~0.75 ≈ ρ 0.95.
+
 | Range | Label |
 |-------|-------|
-| 0.80 - 1.00 | Very Similar |
-| 0.60 - 0.80 | Similar |
-| 0.40 - 0.60 | Moderate |
-| 0.00 - 0.40 | Weak |
+| 0.75 - 1.00 | Very Similar |
+| 0.55 - 0.75 | Similar |
+| 0.35 - 0.55 | Moderate |
+| 0.00 - 0.35 | Weak |
 
 ---
 
@@ -271,7 +282,7 @@ Produces day-by-day price projections based on what happened after similar histo
 Only matches above a minimum composite score are included. This prevents weak/noisy matches from diluting the forecast.
 
 ```
-quality_matches = [m for m in matches if m.composite_score >= 0.4]
+quality_matches = [m for m in matches if m.composite_score >= 0.35]
 if len(quality_matches) < 2:
     quality_matches = top 3 matches regardless of score
 ```
@@ -345,7 +356,7 @@ When a recent event exists, the forecast anchors to the event-day close and comp
 
 | Constant | Value | Location | Purpose |
 |----------|-------|----------|---------|
-| `FORECAST_MIN_SCORE` | 0.4 | `cli.py` | Quality gate threshold |
+| `FORECAST_MIN_SCORE` | 0.35 | `cli.py` | Quality gate threshold (null-calibrated "Moderate" floor) |
 | `FORECAST_MIN_MATCHES` | 2 | `cli.py` | Minimum matches after quality gate |
 | `FORECAST_FALLBACK_N` | 3 | `cli.py` | Fallback top-N if too few pass gate |
 | `FORECAST_CONF_DECAY` | 0.05 | `cli.py` | Confidence loss per forecast day |

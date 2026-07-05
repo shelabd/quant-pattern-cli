@@ -146,6 +146,20 @@ def find_support_resistance(
 
 # ── Pattern Similarity ──────────────────────────────────────────────────────────
 
+# Null-calibration constants for the composite score. Each metric is
+# re-centered on its expectation for INDEPENDENT random-walk windows so pure
+# noise scores ~0 (Monte Carlo, window lengths 10-21, mixed vol regimes):
+#   DTW_NULL_FACTOR — median banded-DTW-per-point / RMS dispersion of
+#     independent walks; the band lets DTW warp below the raw distance, so
+#     its null sits below the Euclidean one.
+#   VOL_RATIO_NULL — mean min/max std ratio of independent windows.
+# Composite null after re-centering: mean ~0.15, p90 ~0.38; 0.5-correlated
+# walks score ~0.35, 0.8-correlated ~0.55, 0.95-correlated ~0.77 — the
+# score_label thresholds are anchored to those points.
+DTW_NULL_FACTOR = 1.15
+VOL_RATIO_NULL = 0.60
+
+
 @dataclass
 class SimilarityResult:
     """Result of comparing two price windows."""
@@ -161,11 +175,14 @@ class SimilarityResult:
 
     @property
     def score_label(self) -> str:
-        if self.composite_score >= 0.8:
+        # Thresholds anchored to the Monte-Carlo composite of correlated
+        # random walks: ~0.35 ≈ rho 0.5, ~0.55 ≈ rho 0.8, ~0.75 ≈ rho 0.95
+        # (null p90 is ~0.38, so "Weak" covers noise).
+        if self.composite_score >= 0.75:
             return "Very Similar"
-        elif self.composite_score >= 0.6:
+        elif self.composite_score >= 0.55:
             return "Similar"
-        elif self.composite_score >= 0.4:
+        elif self.composite_score >= 0.35:
             return "Moderate"
         else:
             return "Weak"
@@ -254,25 +271,37 @@ def compare_windows(
     h_vol = np.std(h_clean) if np.std(h_clean) > 0 else 1e-10
     vol_ratio = min(t_vol, h_vol) / max(t_vol, h_vol)
 
-    # Composite score: weighted combination.
-    # Distance scores are normalized by the windows' combined dispersion so
-    # they stay comparable across tickers and volatility regimes (a fixed
-    # divisor saturates for high-vol series and inflates for quiet ones).
-    corr_score = (corr + 1) / 2  # map [-1, 1] to [0, 1]
-    dispersion = float(np.std(t_clean) + np.std(h_clean))
-    if dispersion > 1e-12:
-        euc_score = max(0, 1 - euc / dispersion)
-        dtw_score = max(0, 1 - dtw_norm / dispersion)
+    # Composite score: weighted combination, each metric re-centered on its
+    # random-window null so unrelated windows score ~0. (The previous scheme
+    # — (corr+1)/2, raw dir_match, raw vol_ratio, and distances over
+    # std_t+std_h — floored the composite near 0.44 for pure noise, which the
+    # labels then called "Moderate".)
+    #   corr:      E[corr]=0 for independent windows -> negative corr is
+    #              anti-similarity, clamp at 0.
+    #   euc/dtw:   normalized by the RMS dispersion sqrt(std_t^2+std_h^2),
+    #              the natural distance scale of independent series; typical
+    #              unrelated random walks land at or above 1 and clamp to 0.
+    #              DTW additionally re-centered by DTW_NULL_FACTOR since the
+    #              band warps its null below the Euclidean one.
+    #   direction: null is 50% sign agreement -> rescale to 2m-1.
+    #   vol ratio: null min/max std ratio ~VOL_RATIO_NULL -> rescale above it.
+    corr_score = max(0.0, corr)
+    rms_dispersion = float(np.sqrt(np.std(t_clean) ** 2 + np.std(h_clean) ** 2))
+    if rms_dispersion > 1e-12:
+        euc_score = max(0.0, 1 - euc / rms_dispersion)
+        dtw_score = max(0.0, 1 - dtw_norm / (DTW_NULL_FACTOR * rms_dispersion))
     else:
         # Both series flat: identical flats are a perfect match
         euc_score = dtw_score = 1.0 if euc < 1e-12 else 0.0
+    dir_score = max(0.0, 2 * dir_match - 1)
+    vol_score = max(0.0, (vol_ratio - VOL_RATIO_NULL) / (1 - VOL_RATIO_NULL))
 
     composite = (
         0.30 * corr_score
         + 0.20 * euc_score
         + 0.20 * dtw_score
-        + 0.20 * dir_match
-        + 0.10 * vol_ratio
+        + 0.20 * dir_score
+        + 0.10 * vol_score
     )
 
     return SimilarityResult(
