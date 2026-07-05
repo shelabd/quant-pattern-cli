@@ -1401,6 +1401,23 @@ def display_journal(scored: list, pending: list, stats: dict) -> None:
                 ctext.append("  |  bias: ", style="white")
                 ctext.append(f"${bias:+,.2f}", style=f"bold {bias_style}")
                 ctext.append(" (actual − predicted)", style="dim")
+            cen = stats.get("centering")
+            if cen:
+                ctext.append("\nSettle centering (POP centers at spot; coefficients stay 0 "
+                             "until these turn positive)\n", style="bold white")
+                if cen.get("median_pin_pull") is not None:
+                    pull = cen["median_pin_pull"]
+                    pull_style = "green" if pull > 0 else "red"
+                    ctext.append(f"Pin pull (n={cen['n_pin']}): ", style="white")
+                    ctext.append(f"{pull:+.2f}", style=f"bold {pull_style}")
+                    ctext.append(" (1=settles on pin, 0=no pull, <0=repelled)", style="dim")
+                if cen.get("mean_drift_signed_move") is not None:
+                    dm = cen["mean_drift_signed_move"]
+                    dm_style = "green" if dm > 0 else "red"
+                    ctext.append(f"\nDrift call (n={cen['n_drift']}): ", style="white")
+                    ctext.append(f"${dm:+,.2f}", style=f"bold {dm_style}")
+                    ctext.append(f" mean move in called direction  |  right {cen['drift_hit_rate']:.0%} of the time",
+                                 style="dim")
             console.print(Panel(ctext, title="[bold]Expected-Move Model[/bold]", border_style="magenta"))
 
             buckets = cal.get("buckets") or []

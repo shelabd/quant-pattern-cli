@@ -185,6 +185,32 @@ def summarize(scored: list[dict]) -> dict:
             "worst_r": min(e["r_multiple"] for e in trades),
         })
 
+    # ── Realized centering coefficients (pin pull & drift) ───────────────
+    # The POP/EV settle distribution centers at spot with POP_PIN_PULL and
+    # POP_DRIFT_SHIFT both 0 (butterfly.py). These are the realized values
+    # of the two coefficients — the evidence that would justify raising
+    # them: pin_pull is the median of (settle−spot)/(pin−spot) (1 = settles
+    # land on the pin, 0 = no pull, negative = repelled); drift_move is the
+    # mean settle−spot move signed by the drift call (positive = the drift
+    # direction was right on average).
+    with_settle = [e for e in scored
+                   if e.get("settle") is not None and e.get("spot")
+                   and e.get("body_strike") is not None]
+    pulls = [(e["settle"] - e["spot"]) / (e["body_strike"] - e["spot"])
+             for e in with_settle if abs(e["body_strike"] - e["spot"]) > 1e-9]
+    drift_moves = [(e["settle"] - e["spot"]) * (1 if e["drift"] == "bullish" else -1)
+                   for e in with_settle if e.get("drift") in ("bullish", "bearish")]
+    if pulls or drift_moves:
+        centering: dict = {}
+        if pulls:
+            centering["n_pin"] = len(pulls)
+            centering["median_pin_pull"] = round(median(pulls), 2)
+        if drift_moves:
+            centering["n_drift"] = len(drift_moves)
+            centering["mean_drift_signed_move"] = round(mean(drift_moves), 2)
+            centering["drift_hit_rate"] = round(mean(m > 0 for m in drift_moves), 3)
+        out["centering"] = centering
+
     # ── Expected-move forecast calibration (POP & EV vs realized) ────────
     forecast = [e for e in trades if e.get("prob_profit") is not None]
     if forecast:

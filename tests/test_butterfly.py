@@ -22,6 +22,7 @@ from quant_patterns.butterfly import (
     event_vol_addon,
     event_warnings,
     expected_move,
+    pop_center,
     floor_to_cent,
     fly_expected_value,
     max_debit_for,
@@ -423,6 +424,24 @@ class TestExpectedMove:
         em = expected_move(750.0, 0.01, dte=1, event_pct=0.011)
         assert em["total"] == pytest.approx(750.0 * 0.011)
         assert em["total"] > em["diffusion"]
+
+
+class TestPopCenter:
+    def test_default_is_spot(self):
+        # Risk-neutral default: neither the pin nor the drift call shifts
+        # the odds the engine quotes for itself.
+        assert pop_center(750.0, 745.0, "bullish", 5.0) == 750.0
+        assert pop_center(750.0, 760.0, "bearish", 5.0) == 750.0
+
+    def test_pin_pull_moves_toward_body(self):
+        assert pop_center(750.0, 745.0, "neutral", 5.0, pin_pull=1.0) == 745.0
+        assert pop_center(750.0, 745.0, "neutral", 5.0, pin_pull=0.5) == 747.5
+
+    def test_drift_shift_signed_by_call(self):
+        up = pop_center(750.0, 750.0, "bullish", 4.0, drift_shift=0.25)
+        down = pop_center(750.0, 750.0, "bearish", 4.0, drift_shift=0.25)
+        flat = pop_center(750.0, 750.0, "neutral", 4.0, drift_shift=0.25)
+        assert up == 751.0 and down == 749.0 and flat == 750.0
 
 
 class TestProbInProfit:

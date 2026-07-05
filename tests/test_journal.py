@@ -166,6 +166,27 @@ class TestSummarize:
                                   today=date(2026, 6, 18))
         assert json.loads(json.dumps(summarize(scored)))["n_trades"] == 1
 
+class TestCenteringDiagnostics:
+    def test_realized_pull_and_drift_coefficients(self):
+        # make_rec: spot 737.76, pin 733.0 (below spot), drift bearish.
+        scored = [
+            # settle lands exactly on the pin: pull = 1, bearish call right
+            score_entry(entry_dict(body=733.0, width=3.0, debit=0.20), settle=733.0),
+            # settle moves the same distance AWAY from the pin: pull = -1,
+            # bearish call wrong
+            score_entry(entry_dict(body=733.0, width=3.0, debit=0.20), settle=742.52),
+        ]
+        cen = summarize(scored)["centering"]
+        assert cen["n_pin"] == 2
+        assert cen["median_pin_pull"] == pytest.approx(0.0)
+        assert cen["n_drift"] == 2
+        assert cen["drift_hit_rate"] == 0.5
+        assert cen["mean_drift_signed_move"] == pytest.approx(0.0)
+
+    def test_no_centering_without_settles(self):
+        assert "centering" not in summarize([])
+
+
 # ── Expected-move forecast calibration ────────────────────────────────────────
 
 

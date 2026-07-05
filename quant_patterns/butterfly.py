@@ -88,6 +88,23 @@ EVENT_VOL_ADDON: dict[str, float] = {
 }
 
 
+# POP/EV settle-distribution centering: N(center, sigma) with
+#   center = spot + POP_PIN_PULL·(body − spot) + drift_sign·POP_DRIFT_SHIFT·σ
+# Both coefficients default to 0 — the martingale (risk-neutral) stance. That
+# is deliberate, not an accident of passing `spot` around: the engine's strike
+# selection believes in pin pull and drift, but self-injecting that alpha into
+# the odds it quotes for itself makes POP self-confirming. The forward-test
+# journal (17 SPY entries, Jun–Jul 2026) measured the median realized pull
+# (settle−spot)/(pin−spot) at ≈ −0.5 (settles moved AWAY from the pin) and
+# drift-signed moves with the wrong sign (bullish calls −$4.8 mean move,
+# bearish +$7.5) — at face value both coefficients would have widened the gap
+# between predicted POP (29%) and realized win rate (18%). `qpat journal`
+# reports both realized coefficients each run; raise these defaults only when
+# that evidence turns positive.
+POP_PIN_PULL = 0.0
+POP_DRIFT_SHIFT = 0.0
+
+
 class UnpriceableStrikeError(ValueError):
     """A required leg has no bid/ask and no last price — never price as 0."""
 
@@ -159,6 +176,7 @@ class FlyRecommendation:
     prob_profit: Optional[float] = None         # P(settle inside breakevens)
     expected_value: Optional[float] = None      # EV per fly, dollars (net of debit)
     body_sigma: Optional[float] = None          # |body - spot| in expected-move sigmas
+    settle_center: Optional[float] = None       # center of the POP/EV settle distribution
 
     def to_dict(self) -> dict:
         def per_fly(v: Optional[float]) -> Optional[float]:
@@ -206,6 +224,7 @@ class FlyRecommendation:
             "prob_profit": round(self.prob_profit, 4) if self.prob_profit is not None else None,
             "expected_value_per_fly": round(self.expected_value, 2) if self.expected_value is not None else None,
             "body_sigma": round(self.body_sigma, 2) if self.body_sigma is not None else None,
+            "settle_center": round(self.settle_center, 2) if self.settle_center is not None else None,
             "disclaimer": "Analysis only — not financial advice. OI as of last close; verify on your broker before entry.",
         }
         return d
@@ -542,6 +561,22 @@ def expected_move(spot: float, iv: float, dte: int, event_pct: float = 0.0) -> d
         "total": total,
         "pct": (total / spot) if spot > 0 else 0.0,
     }
+
+
+def pop_center(
+    spot: float, body: float, drift: str, sigma: float,
+    pin_pull: float = POP_PIN_PULL, drift_shift: float = POP_DRIFT_SHIFT,
+) -> float:
+    """Center of the settle distribution used for POP/EV.
+
+    Makes the two forces strike selection believes in — pin pull toward the
+    body and directional drift — explicit parameters of the odds model, so
+    their weight is a documented choice rather than an accident of centering
+    at spot. Both weights currently default to 0 (see POP_PIN_PULL /
+    POP_DRIFT_SHIFT for the journal evidence behind that).
+    """
+    d = 1.0 if drift == "bullish" else -1.0 if drift == "bearish" else 0.0
+    return spot + pin_pull * (body - spot) + d * drift_shift * sigma
 
 
 def prob_in_profit(
@@ -929,9 +964,11 @@ def recommend_fly(
     # ladder against the debit ceiling. An explicit fixed_width always keeps
     # its R:R-ceiling semantics, so it routes through the ladder.
     sigma = em["total"]
+    center = pop_center(spot, body, drift, sigma)
+    em_fields["settle_center"] = center
     if fixed_width is None and select == "pop":
         sel = select_width_by_pop(
-            chain, body, right, expiry, sigma, spot,
+            chain, body, right, expiry, sigma, center,
             target_pop=target_pop, min_rr=POP_MIN_RR,
             max_width=max(POP_MAX_WIDTH_FLOOR, 2 * sigma),
         )
@@ -1004,8 +1041,8 @@ def recommend_fly(
         attempts = result["attempts"]
         adaptive = result["adaptive"]
         ceiling = max_debit_for(width, min_rr)
-        pop = prob_in_profit(ratio["breakeven_low"], ratio["breakeven_high"], sigma, spot)
-        ev_per_fly = fly_expected_value(body, width, debit, sigma, spot) * 100
+        pop = prob_in_profit(ratio["breakeven_low"], ratio["breakeven_high"], sigma, center)
+        ev_per_fly = fly_expected_value(body, width, debit, sigma, center) * 100
 
     # ── Event skip rule ───────────────────────────────────────────────
     warnings, half_size = event_warnings(in_window, coverage, today, expiry)
