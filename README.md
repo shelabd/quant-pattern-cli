@@ -165,9 +165,18 @@ clustered into one actionable level per side: nearest-expiry **OI walls**
 gamma-weighted "magnet"), the **ATM-IV expected move over the remaining
 session** (shrinks into the close), and **price structure** (VWAP, opening
 range, session and prior-day high/low/close). Candidates within 0.15% merge;
-a cluster containing an OI wall snaps to the wall's strike. Every snapshot
-appends to `~/.qpat/scalp_journal.jsonl`. Designed to run every 30 minutes
-during the session via launchd with `--notify --cron`:
+a cluster containing an OI wall snaps to the wall's strike.
+
+Each snapshot also carries an **entry/exit plan** per side: long buys the
+floor, short fades the ceiling (mean-reversion between the extremes — the
+only trade the levels support). Entry is a ±0.05% zone around the level,
+stop 0.10% beyond it, T1 at VWAP/magnet when one sits ≥1R inside the range
+(else mid-range), T2 just inside the opposite level, with R-multiples for
+both. A plan whose reward:risk to T2 is under 1.5 says *stand aside*
+instead; counter-trend sides (against spot-vs-VWAP) and targets beyond the
+remaining-session 1σ are flagged. Every snapshot appends to
+`~/.qpat/scalp_journal.jsonl`. Designed to run every 30 minutes during the
+session via launchd with `--notify --cron`:
 
 | Flag | Description |
 |------|-------------|

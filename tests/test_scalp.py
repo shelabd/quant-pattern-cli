@@ -7,7 +7,9 @@ import pytest
 
 from quant_patterns.scalp import (
     ET,
+    MIN_RR,
     LevelCandidate,
+    ScalpLevels,
     _pick_level,
     compute_scalp_levels,
     format_message,
@@ -15,6 +17,7 @@ from quant_patterns.scalp import (
     is_market_open,
     oi_wall_candidates,
     remaining_sigma,
+    scalp_setups,
     session_minutes_remaining,
 )
 
@@ -172,3 +175,75 @@ class TestComputeScalpLevels:
         msg = format_message(lv)
         assert "SPY scalp" in msg and "Floor" in msg and "Ceiling" in msg
         assert "not financial advice" in msg
+
+
+def snapshot(spot=745.0, floor=740.0, ceiling=752.0, vwap=744.0,
+             magnet=None, sigma=4.0):
+    return ScalpLevels(
+        ticker="SPY", asof=et(2026, 7, 6, 11, 0), spot=spot,
+        floor=floor, ceiling=ceiling, vwap=vwap, magnet=magnet,
+        sigma_remaining=sigma, minutes_left=300,
+    )
+
+
+class TestScalpSetups:
+    def test_two_sided_plan(self):
+        setups = scalp_setups(snapshot())
+        assert {s.side for s in setups} == {"long", "short"}
+        long = next(s for s in setups if s.side == "long")
+        short = next(s for s in setups if s.side == "short")
+        # geometry: stop beyond the level, targets inside the range
+        assert long.stop < long.entry_lo <= 740.0 <= long.entry_hi
+        assert long.target1 < long.target2 < 752.0
+        assert short.stop > short.entry_hi >= 752.0 >= short.entry_lo
+        assert short.target1 > short.target2 > 740.0
+
+    def test_nearest_trigger_first(self):
+        setups = scalp_setups(snapshot(spot=750.0))  # closer to the ceiling
+        assert setups[0].side == "short"
+
+    def test_rr_math(self):
+        long = next(s for s in scalp_setups(snapshot()) if s.side == "long")
+        risk = long.trigger - long.stop
+        assert long.rr1 == pytest.approx((long.target1 - long.trigger) / risk)
+        assert long.rr2 == pytest.approx((long.target2 - long.trigger) / risk)
+        assert long.rr2 >= MIN_RR and not long.skip_reason
+
+    def test_trend_bias_from_vwap(self):
+        # spot above VWAP: long is with-trend, short counter-trend
+        setups = scalp_setups(snapshot(spot=745.0, vwap=744.0))
+        assert next(s for s in setups if s.side == "long").with_trend
+        short = next(s for s in setups if s.side == "short")
+        assert not short.with_trend
+        assert any("counter-trend" in n for n in short.notes)
+
+    def test_vwap_is_t1_when_inside_range(self):
+        long = next(s for s in scalp_setups(snapshot(floor=740.0, vwap=744.0))
+                    if s.side == "long")
+        assert long.target1_label == "VWAP" and long.target1 == 744.0
+
+    def test_midrange_t1_without_vwap(self):
+        long = next(s for s in scalp_setups(snapshot(vwap=None))
+                    if s.side == "long")
+        assert long.target1_label == "mid-range"
+
+    def test_tight_range_is_skipped(self):
+        setups = scalp_setups(snapshot(floor=744.5, ceiling=745.5))
+        assert setups and all(s.skip_reason for s in setups)
+
+    def test_target_beyond_sigma_noted(self):
+        long = next(s for s in scalp_setups(snapshot(sigma=2.0))
+                    if s.side == "long")  # ceiling is 12 pts away, 1σ only 2
+        assert any("1σ" in n for n in long.notes)
+
+    def test_missing_level_means_no_setups(self):
+        assert scalp_setups(snapshot(ceiling=None)) == []
+
+    def test_setups_in_message_and_dict(self):
+        lv = snapshot()
+        lv.setups = scalp_setups(lv)
+        msg = format_message(lv)
+        assert "LONG" in msg and "SHORT" in msg and "stop" in msg
+        d = lv.to_dict()
+        assert len(d["setups"]) == 2
+        assert {"side", "entry_zone", "stop", "target1", "rr2"} <= set(d["setups"][0])

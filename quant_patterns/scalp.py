@@ -42,6 +42,14 @@ CLUSTER_PCT = 0.15
 # band — intraday ranges regularly stretch past 1.5%.
 WALL_BAND_PCT = 2.5
 
+# Trade-plan geometry (all % of spot). Stops sit beyond the level so a
+# tag-and-reject doesn't shake the position out; entries are a zone, not a
+# tick, because levels are cluster centers with CLUSTER_PCT resolution.
+ENTRY_ZONE_PCT = 0.05
+STOP_BUFFER_PCT = 0.10
+# Below this reward:risk to the far target the range is too tight to scalp.
+MIN_RR = 1.5
+
 # Source weights: OI walls anchor the structure, the shrinking IV band and
 # VWAP carry real-time information, static session levels confirm.
 SOURCE_WEIGHTS = {
@@ -71,6 +79,50 @@ class LevelCandidate:
 
 
 @dataclass
+class ScalpSetup:
+    """A mechanical entry/exit plan hung off one of the levels.
+
+    ``trigger`` is the level itself; the entry zone brackets it because
+    levels are cluster centers, not ticks. R-multiples are measured from
+    the trigger against the stop. A non-empty ``skip_reason`` means the
+    geometry doesn't pay — stand aside rather than force it.
+    """
+    side: str                     # "long" | "short"
+    trigger: float                # the level the plan hangs off
+    trigger_label: str            # "floor bounce" / "ceiling fade"
+    entry_lo: float
+    entry_hi: float
+    stop: float
+    target1: float
+    target1_label: str
+    rr1: float
+    target2: Optional[float] = None
+    target2_label: str = ""
+    rr2: Optional[float] = None
+    with_trend: bool = True       # side agrees with spot-vs-VWAP
+    notes: list[str] = field(default_factory=list)
+    skip_reason: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "side": self.side,
+            "trigger": round(self.trigger, 2),
+            "trigger_label": self.trigger_label,
+            "entry_zone": [round(self.entry_lo, 2), round(self.entry_hi, 2)],
+            "stop": round(self.stop, 2),
+            "target1": round(self.target1, 2),
+            "target1_label": self.target1_label,
+            "rr1": round(self.rr1, 1),
+            "target2": round(self.target2, 2) if self.target2 is not None else None,
+            "target2_label": self.target2_label,
+            "rr2": round(self.rr2, 1) if self.rr2 is not None else None,
+            "with_trend": self.with_trend,
+            "notes": list(self.notes),
+            "skip_reason": self.skip_reason,
+        }
+
+
+@dataclass
 class ScalpLevels:
     """Floor/ceiling snapshot for one 30-minute check-in."""
     ticker: str
@@ -88,6 +140,7 @@ class ScalpLevels:
     chain_expiry: Optional[str] = None
     minutes_left: int = 0
     warnings: list[str] = field(default_factory=list)
+    setups: list[ScalpSetup] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -106,6 +159,7 @@ class ScalpLevels:
             "chain_expiry": self.chain_expiry,
             "minutes_left": self.minutes_left,
             "warnings": list(self.warnings),
+            "setups": [s.to_dict() for s in self.setups],
             "disclaimer": "Analysis only — not financial advice. OI as of last close.",
         }
 
@@ -248,6 +302,82 @@ def _pick_level(
     return level, sources
 
 
+# ── Entry/exit setups ────────────────────────────────────────────────────────
+
+def _first_target(
+    entry: float, stop: float, final: float, side: str,
+    vwap: Optional[float], magnet: Optional[float],
+) -> tuple[float, str]:
+    """Nearest meaningful partial-profit spot between entry and the far
+    target: VWAP or the OI magnet when one sits at least 1R inside the
+    range, else the range midpoint."""
+    risk = abs(entry - stop)
+    lo, hi = (entry, final) if side == "long" else (final, entry)
+    named = [(vwap, "VWAP"), (magnet, "magnet")]
+    viable = [(p, lbl) for p, lbl in named
+              if p is not None and lo < p < hi and abs(p - entry) >= risk]
+    if viable:
+        return min(viable, key=lambda t: abs(t[0] - entry))
+    return (entry + final) / 2, "mid-range"
+
+
+def _build_setup(
+    side: str, trigger: float, far: float, spot: float,
+    vwap: Optional[float], magnet: Optional[float],
+    sigma: Optional[float],
+) -> ScalpSetup:
+    zone = spot * ENTRY_ZONE_PCT / 100
+    buffer = spot * STOP_BUFFER_PCT / 100
+    sign = 1.0 if side == "long" else -1.0
+    stop = trigger - sign * buffer
+    # Exit just inside the far level — the crowd's orders sit ON it.
+    target2 = far - sign * zone
+    risk = abs(trigger - stop)
+    rr2 = abs(target2 - trigger) / risk
+    target1, t1_label = _first_target(trigger, stop, target2, side, vwap, magnet)
+    rr1 = abs(target1 - trigger) / risk
+
+    label = "floor bounce" if side == "long" else "ceiling fade"
+    with_trend = vwap is None or (spot >= vwap) == (side == "long")
+    notes: list[str] = []
+    if not with_trend:
+        notes.append("counter-trend — wait for rejection (wick/stall) before entry")
+    if sigma and abs(target2 - trigger) > sigma:
+        notes.append("T2 beyond remaining 1σ — T1 is the realistic exit")
+
+    skip = ""
+    if rr2 < MIN_RR:
+        skip = f"reward:risk {rr2:.1f} < {MIN_RR:g} — range too tight, stand aside"
+
+    return ScalpSetup(
+        side=side, trigger=trigger, trigger_label=label,
+        entry_lo=trigger - zone, entry_hi=trigger + zone, stop=stop,
+        target1=target1, target1_label=t1_label, rr1=rr1,
+        target2=target2, target2_label="floor" if side == "short" else "ceiling",
+        rr2=rr2, with_trend=with_trend, notes=notes, skip_reason=skip,
+    )
+
+
+def scalp_setups(lv: ScalpLevels) -> list[ScalpSetup]:
+    """Derive mechanical long/short plans from a levels snapshot.
+
+    Long buys the floor, short fades the ceiling — mean-reversion between
+    the range extremes, which is the only trade the levels themselves
+    support. Both sides need both levels (the opposite one is the target).
+    Ordered nearest-trigger first, since that's the actionable one.
+    """
+    if lv.floor is None or lv.ceiling is None:
+        return []
+    setups = [
+        _build_setup("long", lv.floor, lv.ceiling, lv.spot,
+                     lv.vwap, lv.magnet, lv.sigma_remaining),
+        _build_setup("short", lv.ceiling, lv.floor, lv.spot,
+                      lv.vwap, lv.magnet, lv.sigma_remaining),
+    ]
+    setups.sort(key=lambda s: abs(s.trigger - lv.spot))
+    return setups
+
+
 def compute_scalp_levels(
     ticker: str,
     spot: float,
@@ -281,7 +411,7 @@ def compute_scalp_levels(
     if ceiling is None:
         warns.append("no candidates above spot — ceiling unavailable")
 
-    return ScalpLevels(
+    levels = ScalpLevels(
         ticker=ticker, asof=now_et, spot=spot,
         floor=floor, floor_sources=floor_srcs,
         ceiling=ceiling, ceiling_sources=ceil_srcs,
@@ -290,6 +420,8 @@ def compute_scalp_levels(
         atm_iv=iv, chain_expiry=chain_expiry,
         minutes_left=minutes_left, warnings=warns,
     )
+    levels.setups = scalp_setups(levels)
+    return levels
 
 
 def format_message(lv: ScalpLevels) -> str:
@@ -304,7 +436,27 @@ def format_message(lv: ScalpLevels) -> str:
         lines.append(f"Magnet {lv.magnet:g}  ({lv.magnet_detail})")
     if lv.sigma_remaining:
         lines.append(f"1σ left: ±{lv.sigma_remaining:.2f} ({lv.minutes_left}m to close)")
+    for s in lv.setups:
+        lines.append("")
+        lines.append(format_setup(s))
     for w in lv.warnings:
         lines.append(f"⚠ {w}")
     lines.append("Analysis only — not financial advice.")
+    return "\n".join(lines)
+
+
+def format_setup(s: ScalpSetup) -> str:
+    """One setup as compact Telegram-friendly lines."""
+    arrow = "🟢 LONG" if s.side == "long" else "🔴 SHORT"
+    trend = "with trend" if s.with_trend else "counter-trend"
+    head = (f"{arrow} {s.trigger_label} {s.entry_lo:.2f}–{s.entry_hi:.2f} "
+            f"({trend})")
+    if s.skip_reason:
+        return f"{head}\n   ✋ {s.skip_reason}"
+    body = (f"   stop {s.stop:.2f} | T1 {s.target1:.2f} "
+            f"{s.target1_label} ({s.rr1:.1f}R) | T2 {s.target2:.2f} "
+            f"{s.target2_label} ({s.rr2:.1f}R)")
+    lines = [head, body]
+    for n in s.notes:
+        lines.append(f"   ⚠ {n}")
     return "\n".join(lines)

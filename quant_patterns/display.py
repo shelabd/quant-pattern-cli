@@ -1383,6 +1383,37 @@ def display_scalp(lv) -> None:
                      f"IV {lv.atm_iv * 100:.0f}%)[/dim]" if lv.atm_iv else
                      f"±{lv.sigma_remaining:.2f}")
     console.print(Panel(body, border_style="cyan"))
+
+    if lv.setups:
+        plan = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
+        plan.add_column("Setup", style="bold")
+        plan.add_column("Entry zone")
+        plan.add_column("Stop")
+        plan.add_column("T1")
+        plan.add_column("T2")
+        plan.add_column("")
+        for s in lv.setups:
+            name = Text(("LONG " if s.side == "long" else "SHORT ") + s.trigger_label,
+                        style="green" if s.side == "long" else "red")
+            if s.skip_reason:
+                plan.add_row(name, f"{s.entry_lo:.2f}–{s.entry_hi:.2f}",
+                             "—", "—", "—", Text(f"✋ {s.skip_reason}", style="yellow"))
+                continue
+            tag = "with trend" if s.with_trend else "counter-trend"
+            plan.add_row(
+                name,
+                f"{s.entry_lo:.2f}–{s.entry_hi:.2f}",
+                f"{s.stop:.2f}",
+                f"{s.target1:.2f} [dim]{s.target1_label} ({s.rr1:.1f}R)[/dim]",
+                f"{s.target2:.2f} [dim]{s.target2_label} ({s.rr2:.1f}R)[/dim]",
+                Text(tag, style="dim" if s.with_trend else "yellow"),
+            )
+        console.print(Panel(plan, title="[bold]Entry/exit plan[/bold]",
+                            border_style="cyan"))
+        for s in lv.setups:
+            for n in s.notes:
+                console.print(f"  [yellow]⚠ {s.side}: {n}[/yellow]")
+
     for w in lv.warnings:
         console.print(f"  [yellow]⚠ {w}[/yellow]")
     console.print(Text("  OI as of last close. Analysis only — not financial advice.",
