@@ -165,7 +165,11 @@ clustered into one actionable level per side: nearest-expiry **OI walls**
 gamma-weighted "magnet"), the **ATM-IV expected move over the remaining
 session** (shrinks into the close), and **price structure** (VWAP, opening
 range, session and prior-day high/low/close). Candidates within 0.15% merge;
-a cluster containing an OI wall snaps to the wall's strike.
+a cluster containing an OI wall snaps to the wall's strike. When weaker
+structure sits *between* spot and the winning level (e.g. spot pressing the
+session high while the call wall is $4 above), it shows as a **near
+floor/ceiling** line — the trigger price must break before the main level
+is in play.
 
 Each snapshot also carries an **entry/exit plan** per side: long buys the
 floor, short fades the ceiling (mean-reversion between the extremes — the

@@ -127,21 +127,35 @@ class TestPickLevel:
             LevelCandidate(744.3, "prior close"),
             LevelCandidate(742.0, "prior low"),
         ]
-        level, sources = _pick_level(cands, 746.0)
+        level, sources, near, near_srcs = _pick_level(cands, 746.0)
         assert 743.9 <= level <= 744.4
         assert len(sources) == 2
+        # the lone 742 candidate is beyond the level, not between: no near
+        assert near is None
 
     def test_snaps_to_wall_strike(self):
         cands = [
             LevelCandidate(744.0, "put wall", "18,000 put OI @ 744"),
             LevelCandidate(744.4, "VWAP"),
         ]
-        level, sources = _pick_level(cands, 746.0)
+        level, sources, _, _ = _pick_level(cands, 746.0)
         assert level == 744.0  # the strike, not the weighted mean
         assert sources[0].startswith("18,000")
 
+    def test_near_level_between_spot_and_main(self):
+        # Wall wins at 755; session high at 751.1 sits between spot and it.
+        cands = [
+            LevelCandidate(755.0, "call wall", "12,000 call OI @ 755"),
+            LevelCandidate(754.5, "expected move"),
+            LevelCandidate(751.1, "session high"),
+        ]
+        level, _, near, near_srcs = _pick_level(cands, 751.0)
+        assert level == 755.0
+        assert near == pytest.approx(751.1)
+        assert near_srcs == ["session high"]
+
     def test_empty(self):
-        assert _pick_level([], 746.0) == (None, [])
+        assert _pick_level([], 746.0) == (None, [], None, [])
 
 
 class TestComputeScalpLevels:
@@ -175,6 +189,22 @@ class TestComputeScalpLevels:
         msg = format_message(lv)
         assert "SPY scalp" in msg and "Floor" in msg and "Ceiling" in msg
         assert "not financial advice" in msg
+
+    def test_near_ceiling_end_to_end(self):
+        # Spot pinned at the session high with a far call wall: the wall is
+        # the ceiling, the session high surfaces as the near ceiling.
+        now = et(2026, 7, 6, 12, 0)
+        today = bars([748, 749, 750, 750.5, 751, 751.1, 751.0])
+        chain = chain_df([745, 750, 755],
+                         put_oi=[15_000, 5_000, 0],
+                         call_oi=[0, 2_000, 12_000])
+        lv = compute_scalp_levels("SPY", 751.0, now, today, None, chain, iv=0.10)
+        assert lv.ceiling == 755.0
+        assert lv.near_ceiling is not None and 751.0 < lv.near_ceiling < 755.0
+        msg = format_message(lv)
+        assert "near ceiling" in msg and "break = room to 755.00" in msg
+        d = lv.to_dict()
+        assert d["near_ceiling"] == round(lv.near_ceiling, 2)
 
 
 def snapshot(spot=745.0, floor=740.0, ceiling=752.0, vwap=744.0,

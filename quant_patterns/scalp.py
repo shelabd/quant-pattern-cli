@@ -132,6 +132,12 @@ class ScalpLevels:
     floor_sources: list[str] = field(default_factory=list)
     ceiling: Optional[float] = None
     ceiling_sources: list[str] = field(default_factory=list)
+    # Intermediate structure between spot and the main levels — what price
+    # must break before the floor/ceiling is in play (e.g. the session high).
+    near_floor: Optional[float] = None
+    near_floor_sources: list[str] = field(default_factory=list)
+    near_ceiling: Optional[float] = None
+    near_ceiling_sources: list[str] = field(default_factory=list)
     vwap: Optional[float] = None
     magnet: Optional[float] = None       # max gamma-weighted OI strike near spot
     magnet_detail: str = ""
@@ -151,6 +157,10 @@ class ScalpLevels:
             "floor_sources": list(self.floor_sources),
             "ceiling": round(self.ceiling, 2) if self.ceiling is not None else None,
             "ceiling_sources": list(self.ceiling_sources),
+            "near_floor": round(self.near_floor, 2) if self.near_floor is not None else None,
+            "near_floor_sources": list(self.near_floor_sources),
+            "near_ceiling": round(self.near_ceiling, 2) if self.near_ceiling is not None else None,
+            "near_ceiling_sources": list(self.near_ceiling_sources),
             "vwap": round(self.vwap, 2) if self.vwap is not None else None,
             "magnet": self.magnet,
             "magnet_detail": self.magnet_detail,
@@ -268,18 +278,32 @@ def oi_wall_candidates(
 
 # ── Clustering / selection ───────────────────────────────────────────────────
 
+def _cluster_level(cl: list[LevelCandidate]) -> tuple[float, list[str], float]:
+    """Resolve a cluster to (level, sources, total weight): snap to its OI
+    wall strike when one is present, else the weight-weighted mean."""
+    total = sum(c.weight for c in cl)
+    walls = [c for c in cl if c.source.endswith("wall")]
+    level = walls[0].price if walls else sum(c.price * c.weight for c in cl) / total
+    sources = [c.detail or c.source for c in
+               sorted(cl, key=lambda c: c.weight, reverse=True)]
+    return level, sources, total
+
+
 def _pick_level(
     cands: list[LevelCandidate], spot: float,
-) -> tuple[Optional[float], list[str]]:
-    """Cluster same-side candidates and return (level, contributing sources).
+) -> tuple[Optional[float], list[str], Optional[float], list[str]]:
+    """Cluster same-side candidates and return
+    (level, sources, near_level, near_sources).
 
     Greedy clustering on price within CLUSTER_PCT of the cluster anchor;
-    the cluster with the highest total weight wins (tie -> nearest spot).
-    The level snaps to the cluster's OI wall strike when one is present,
-    else the weight-weighted mean.
+    the cluster with the highest total weight wins (tie -> nearest spot)
+    and becomes the level. The strongest *remaining* cluster sitting
+    between spot and that level is the near level — intermediate
+    structure (e.g. the session high) that price must break before the
+    main level is in play.
     """
     if not cands:
-        return None, []
+        return None, [], None, []
     ordered = sorted(cands, key=lambda c: c.price)
     clusters: list[list[LevelCandidate]] = []
     for c in ordered:
@@ -294,12 +318,14 @@ def _pick_level(
         return (total, -abs(center - spot))
 
     best = max(clusters, key=cluster_key)
-    total = sum(c.weight for c in best)
-    walls = [c for c in best if c.source.endswith("wall")]
-    level = walls[0].price if walls else sum(c.price * c.weight for c in best) / total
-    sources = [c.detail or c.source for c in
-               sorted(best, key=lambda c: c.weight, reverse=True)]
-    return level, sources
+    level, sources, _ = _cluster_level(best)
+
+    near, near_srcs = None, []
+    inner = [_cluster_level(cl) for cl in clusters if cl is not best]
+    inner = [t for t in inner if abs(t[0] - spot) < abs(level - spot)]
+    if inner:
+        near, near_srcs, _ = max(inner, key=lambda t: (t[2], -abs(t[0] - spot)))
+    return level, sources, near, near_srcs
 
 
 # ── Entry/exit setups ────────────────────────────────────────────────────────
@@ -404,8 +430,10 @@ def compute_scalp_levels(
         cands.append(LevelCandidate(spot + sigma, "expected move",
                                     f"+1σ ({minutes_left}m left)"))
 
-    floor, floor_srcs = _pick_level([c for c in cands if c.price < spot], spot)
-    ceiling, ceil_srcs = _pick_level([c for c in cands if c.price > spot], spot)
+    floor, floor_srcs, near_floor, near_floor_srcs = _pick_level(
+        [c for c in cands if c.price < spot], spot)
+    ceiling, ceil_srcs, near_ceil, near_ceil_srcs = _pick_level(
+        [c for c in cands if c.price > spot], spot)
     if floor is None:
         warns.append("no candidates below spot — floor unavailable")
     if ceiling is None:
@@ -415,6 +443,8 @@ def compute_scalp_levels(
         ticker=ticker, asof=now_et, spot=spot,
         floor=floor, floor_sources=floor_srcs,
         ceiling=ceiling, ceiling_sources=ceil_srcs,
+        near_floor=near_floor, near_floor_sources=near_floor_srcs,
+        near_ceiling=near_ceil, near_ceiling_sources=near_ceil_srcs,
         vwap=vwap, magnet=magnet, magnet_detail=magnet_detail,
         sigma_remaining=sigma if sigma > 0 else None,
         atm_iv=iv, chain_expiry=chain_expiry,
@@ -430,8 +460,16 @@ def format_message(lv: ScalpLevels) -> str:
              f"Spot {lv.spot:.2f}" + (f" | VWAP {lv.vwap:.2f}" if lv.vwap else "")]
     if lv.floor is not None:
         lines.append(f"Floor {lv.floor:.2f}  ({', '.join(lv.floor_sources[:3])})")
+        if lv.near_floor is not None:
+            lines.append(f" ↳ near floor {lv.near_floor:.2f} "
+                         f"({', '.join(lv.near_floor_sources[:2])}) — "
+                         f"break = room to {lv.floor:.2f}")
     if lv.ceiling is not None:
         lines.append(f"Ceiling {lv.ceiling:.2f}  ({', '.join(lv.ceiling_sources[:3])})")
+        if lv.near_ceiling is not None:
+            lines.append(f" ↳ near ceiling {lv.near_ceiling:.2f} "
+                         f"({', '.join(lv.near_ceiling_sources[:2])}) — "
+                         f"break = room to {lv.ceiling:.2f}")
     if lv.magnet is not None:
         lines.append(f"Magnet {lv.magnet:g}  ({lv.magnet_detail})")
     if lv.sigma_remaining:

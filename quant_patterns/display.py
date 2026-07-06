@@ -1371,10 +1371,20 @@ def display_scalp(lv) -> None:
         body.add_row(Text("Ceiling", style="bold red"),
                      Text(f"{lv.ceiling:.2f}  ", style="bold red")
                      + Text(", ".join(lv.ceiling_sources[:4]), style="dim"))
+    if lv.near_ceiling is not None:
+        body.add_row(Text("↳ near", style="red"),
+                     Text(f"{lv.near_ceiling:.2f}  ", style="red")
+                     + Text(", ".join(lv.near_ceiling_sources[:2])
+                            + f" — break = room to {lv.ceiling:.2f}", style="dim"))
     if lv.floor is not None:
         body.add_row(Text("Floor", style="bold green"),
                      Text(f"{lv.floor:.2f}  ", style="bold green")
                      + Text(", ".join(lv.floor_sources[:4]), style="dim"))
+    if lv.near_floor is not None:
+        body.add_row(Text("↳ near", style="green"),
+                     Text(f"{lv.near_floor:.2f}  ", style="green")
+                     + Text(", ".join(lv.near_floor_sources[:2])
+                            + f" — break = room to {lv.floor:.2f}", style="dim"))
     if lv.magnet is not None:
         body.add_row("Magnet", f"{lv.magnet:g}   [dim]{lv.magnet_detail}[/dim]")
     if lv.sigma_remaining:
