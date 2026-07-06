@@ -2203,7 +2203,9 @@ def scalp(ticker, as_json, do_notify, cron, do_log):
 
     warnings: list[str] = []
     try:
-        bars = YFinanceProvider().get_intraday_ohlcv(ticker)
+        # ~5 prior sessions: structure levels use just the last one, the
+        # RVOL baseline averages them all.
+        bars = YFinanceProvider().get_intraday_ohlcv(ticker, days=6)
     except Exception as e:
         if cron:
             click.echo(f"scalp: intraday fetch failed: {e}", err=True)
@@ -2214,7 +2216,8 @@ def scalp(ticker, as_json, do_notify, cron, do_log):
     sessions = sorted(set(bars.index.date))
     last_session = sessions[-1]
     today_bars = bars[bars.index.date == last_session]
-    prior_bars = bars[bars.index.date == sessions[-2]] if len(sessions) > 1 else None
+    prior_sessions = [bars[bars.index.date == s] for s in sessions[:-1]]
+    prior_bars = prior_sessions[-1] if prior_sessions else None
     if last_session != now_et.date():
         if cron:
             return  # holiday — no session today, stay silent
@@ -2241,6 +2244,7 @@ def scalp(ticker, as_json, do_notify, cron, do_log):
     levels = compute_scalp_levels(
         ticker, spot, now_et, today_bars, prior_bars, chain, iv,
         chain_expiry=chain_expiry, warnings=warnings,
+        prior_sessions=prior_sessions,
     )
 
     if do_log:

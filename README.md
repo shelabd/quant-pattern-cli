@@ -164,8 +164,14 @@ clustered into one actionable level per side: nearest-expiry **OI walls**
 (biggest put-OI strike below spot / call-OI strike above, plus the
 gamma-weighted "magnet"), the **ATM-IV expected move over the remaining
 session** (shrinks into the close), and **price structure** (VWAP, opening
-range, session and prior-day high/low/close). Candidates within 0.15% merge;
-a cluster containing an OI wall snaps to the wall's strike. When weaker
+range, session and prior-day high/low/close, plus today's **volume profile**
+— point of control and high-volume nodes, so levels with real acceptance
+outrank prices gapped through). Candidates within 0.15% merge;
+a cluster containing an OI wall snaps to the wall's strike. A **relative
+volume** readout (today vs ~5 prior sessions over the same elapsed time)
+tags the tape regime: ≥1.5× flags trend-day risk (fading extremes is
+unreliable and counter-trend setups say so), ≤0.7× flags a quiet
+range-bound tape. When weaker
 structure sits *between* spot and the winning level (e.g. spot pressing the
 session high while the call wall is $4 above), it shows as a **near
 floor/ceiling** line — the trigger price must break before the main level

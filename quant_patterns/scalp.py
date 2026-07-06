@@ -50,6 +50,18 @@ STOP_BUFFER_PCT = 0.10
 # Below this reward:risk to the far target the range is too tight to scalp.
 MIN_RR = 1.5
 
+# Volume profile: bins are CLUSTER_PCT wide so a POC merges naturally with
+# structural levels sitting on it; secondary nodes must be local maxima at
+# least this fraction of POC volume.
+VP_NODE_MIN_FRAC = 0.6
+VP_MAX_NODES = 2
+
+# Relative volume vs the same elapsed bars of prior sessions. Above the
+# trend threshold the tape is one-directional and fading extremes is the
+# get-run-over trade; below the quiet one, expect range-bound reversion.
+RVOL_TREND = 1.5
+RVOL_QUIET = 0.7
+
 # Source weights: OI walls anchor the structure, the shrinking IV band and
 # VWAP carry real-time information, static session levels confirm.
 SOURCE_WEIGHTS = {
@@ -57,6 +69,8 @@ SOURCE_WEIGHTS = {
     "call wall": 3.0,
     "expected move": 2.0,
     "VWAP": 2.0,
+    "volume POC": 2.0,
+    "volume node": 1.5,
     "opening range low": 1.5,
     "opening range high": 1.5,
     "session low": 1.5,
@@ -139,6 +153,8 @@ class ScalpLevels:
     near_ceiling: Optional[float] = None
     near_ceiling_sources: list[str] = field(default_factory=list)
     vwap: Optional[float] = None
+    rvol: Optional[float] = None         # today's volume vs prior sessions, same elapsed bars
+    rvol_sessions: int = 0               # how many prior sessions the baseline averages
     magnet: Optional[float] = None       # max gamma-weighted OI strike near spot
     magnet_detail: str = ""
     sigma_remaining: Optional[float] = None  # 1-sigma move left in the session ($)
@@ -162,6 +178,8 @@ class ScalpLevels:
             "near_ceiling": round(self.near_ceiling, 2) if self.near_ceiling is not None else None,
             "near_ceiling_sources": list(self.near_ceiling_sources),
             "vwap": round(self.vwap, 2) if self.vwap is not None else None,
+            "rvol": round(self.rvol, 2) if self.rvol is not None else None,
+            "rvol_sessions": self.rvol_sessions,
             "magnet": self.magnet,
             "magnet_detail": self.magnet_detail,
             "sigma_remaining": round(self.sigma_remaining, 2) if self.sigma_remaining is not None else None,
@@ -228,6 +246,68 @@ def intraday_candidates(
         cands.append(LevelCandidate(float(prior["High"].max()), "prior high"))
         cands.append(LevelCandidate(float(prior["Close"].iloc[-1]), "prior close"))
     return cands, vwap
+
+
+def volume_profile_candidates(
+    today: pd.DataFrame, spot: float,
+) -> list[LevelCandidate]:
+    """Where volume actually traded today: the point of control (heaviest
+    price bin) plus up to VP_MAX_NODES secondary high-volume nodes. Levels
+    with real acceptance behave differently from prices gapped through."""
+    if today is None or today.empty:
+        return []
+    typical = (today["High"] + today["Low"] + today["Close"]) / 3
+    vol = today["Volume"].clip(lower=0)
+    total = float(vol.sum())
+    if total <= 0 or spot <= 0:
+        return []
+    bin_w = spot * CLUSTER_PCT / 100
+    profile = vol.groupby((typical / bin_w).round().astype(int)).sum()
+    if len(profile) < 3:  # too little dispersion for a profile to mean anything
+        return []
+    poc_bin = int(profile.idxmax())
+    poc_vol = float(profile.max())
+    cands = [LevelCandidate(poc_bin * bin_w, "volume POC",
+                            f"vol POC ({poc_vol / total:.0%} of session)")]
+    nodes = []
+    for b, v in profile.items():
+        if abs(b - poc_bin) <= 1 or v < VP_NODE_MIN_FRAC * poc_vol:
+            continue
+        if v >= profile.get(b - 1, 0) and v >= profile.get(b + 1, 0):
+            nodes.append((float(v), int(b)))
+    for v, b in sorted(nodes, reverse=True)[:VP_MAX_NODES]:
+        cands.append(LevelCandidate(b * bin_w, "volume node",
+                                    f"vol node ({v / total:.0%} of session)"))
+    return cands
+
+
+def relative_volume(
+    today: pd.DataFrame, prior_sessions: list[pd.DataFrame],
+) -> Optional[float]:
+    """Today's cumulative volume vs the average of prior sessions over the
+    SAME number of elapsed bars — comparing 11am-so-far to full prior days
+    would make every morning look quiet."""
+    if today is None or today.empty:
+        return None
+    n = len(today)
+    base = [float(p["Volume"].iloc[:n].sum())
+            for p in prior_sessions or [] if p is not None and not p.empty]
+    base = [b for b in base if b > 0]
+    if not base:
+        return None
+    return float(today["Volume"].sum()) / (sum(base) / len(base))
+
+
+def rvol_regime(rvol: Optional[float]) -> str:
+    """Human-readable tape regime; empty string in the normal band."""
+    if rvol is None:
+        return ""
+    if rvol >= RVOL_TREND:
+        return (f"RVOL {rvol:.1f}× — trend-day tape: fades unreliable, "
+                "respect breakouts")
+    if rvol <= RVOL_QUIET:
+        return f"RVOL {rvol:.1f}× — quiet tape: expect range-bound reversion"
+    return ""
 
 
 def oi_wall_candidates(
@@ -350,7 +430,7 @@ def _first_target(
 def _build_setup(
     side: str, trigger: float, far: float, spot: float,
     vwap: Optional[float], magnet: Optional[float],
-    sigma: Optional[float],
+    sigma: Optional[float], rvol: Optional[float] = None,
 ) -> ScalpSetup:
     zone = spot * ENTRY_ZONE_PCT / 100
     buffer = spot * STOP_BUFFER_PCT / 100
@@ -368,6 +448,9 @@ def _build_setup(
     notes: list[str] = []
     if not with_trend:
         notes.append("counter-trend — wait for rejection (wick/stall) before entry")
+        if rvol is not None and rvol >= RVOL_TREND:
+            notes.append(f"RVOL {rvol:.1f}× trend tape — counter-trend fade is "
+                         "the get-run-over trade; skip unless rejection is clear")
     if sigma and abs(target2 - trigger) > sigma:
         notes.append("T2 beyond remaining 1σ — T1 is the realistic exit")
 
@@ -396,9 +479,9 @@ def scalp_setups(lv: ScalpLevels) -> list[ScalpSetup]:
         return []
     setups = [
         _build_setup("long", lv.floor, lv.ceiling, lv.spot,
-                     lv.vwap, lv.magnet, lv.sigma_remaining),
+                     lv.vwap, lv.magnet, lv.sigma_remaining, lv.rvol),
         _build_setup("short", lv.ceiling, lv.floor, lv.spot,
-                      lv.vwap, lv.magnet, lv.sigma_remaining),
+                      lv.vwap, lv.magnet, lv.sigma_remaining, lv.rvol),
     ]
     setups.sort(key=lambda s: abs(s.trigger - lv.spot))
     return setups
@@ -414,13 +497,26 @@ def compute_scalp_levels(
     iv: Optional[float],
     chain_expiry: Optional[str] = None,
     warnings: Optional[list[str]] = None,
+    prior_sessions: Optional[list[pd.DataFrame]] = None,
 ) -> ScalpLevels:
-    """Assemble candidates from all families and pick floor & ceiling."""
+    """Assemble candidates from all families and pick floor & ceiling.
+
+    ``prior_sessions`` (oldest→newest, excluding today) is the RVOL
+    baseline; falls back to just ``prior`` when not given.
+    """
     warns = list(warnings or [])
     cands, vwap = intraday_candidates(today, prior)
+    cands += volume_profile_candidates(today, spot)
     wall_cands, magnet, magnet_detail = oi_wall_candidates(chain, spot) \
         if chain is not None else ([], None, "")
     cands += wall_cands
+
+    baseline = prior_sessions if prior_sessions is not None else \
+        ([prior] if prior is not None else [])
+    rvol = relative_volume(today, baseline)
+    regime = rvol_regime(rvol)
+    if regime:
+        warns.append(regime)
 
     minutes_left = session_minutes_remaining(now_et)
     sigma = remaining_sigma(spot, iv or 0.0, minutes_left)
@@ -445,7 +541,9 @@ def compute_scalp_levels(
         ceiling=ceiling, ceiling_sources=ceil_srcs,
         near_floor=near_floor, near_floor_sources=near_floor_srcs,
         near_ceiling=near_ceil, near_ceiling_sources=near_ceil_srcs,
-        vwap=vwap, magnet=magnet, magnet_detail=magnet_detail,
+        vwap=vwap, rvol=rvol,
+        rvol_sessions=sum(1 for p in baseline if p is not None and not p.empty),
+        magnet=magnet, magnet_detail=magnet_detail,
         sigma_remaining=sigma if sigma > 0 else None,
         atm_iv=iv, chain_expiry=chain_expiry,
         minutes_left=minutes_left, warnings=warns,
@@ -456,8 +554,12 @@ def compute_scalp_levels(
 
 def format_message(lv: ScalpLevels) -> str:
     """Plain-text summary for Telegram delivery."""
-    lines = [f"⚡ {lv.ticker} scalp — {lv.asof.strftime('%H:%M')} ET",
-             f"Spot {lv.spot:.2f}" + (f" | VWAP {lv.vwap:.2f}" if lv.vwap else "")]
+    spot_line = f"Spot {lv.spot:.2f}"
+    if lv.vwap:
+        spot_line += f" | VWAP {lv.vwap:.2f}"
+    if lv.rvol is not None:
+        spot_line += f" | RVOL {lv.rvol:.1f}×"
+    lines = [f"⚡ {lv.ticker} scalp — {lv.asof.strftime('%H:%M')} ET", spot_line]
     if lv.floor is not None:
         lines.append(f"Floor {lv.floor:.2f}  ({', '.join(lv.floor_sources[:3])})")
         if lv.near_floor is not None:

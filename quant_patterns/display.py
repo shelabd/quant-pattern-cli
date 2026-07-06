@@ -1367,6 +1367,15 @@ def display_scalp(lv) -> None:
         rel = "above" if lv.spot >= lv.vwap else "below"
         spot_line += f"   (VWAP {lv.vwap:.2f}, spot {rel})"
     body.add_row("Spot", spot_line)
+    if lv.rvol is not None:
+        from .scalp import RVOL_QUIET, RVOL_TREND
+        style = ("bold yellow" if lv.rvol >= RVOL_TREND
+                 else "dim" if lv.rvol <= RVOL_QUIET else "")
+        body.add_row("RVOL", Text(
+            f"{lv.rvol:.1f}× ", style=style)
+            + Text(f"(vs {lv.rvol_sessions} prior session"
+                   f"{'s' if lv.rvol_sessions != 1 else ''}, same elapsed time)",
+                   style="dim"))
     if lv.ceiling is not None:
         body.add_row(Text("Ceiling", style="bold red"),
                      Text(f"{lv.ceiling:.2f}  ", style="bold red")

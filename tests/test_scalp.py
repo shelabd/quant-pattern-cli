@@ -16,9 +16,12 @@ from quant_patterns.scalp import (
     intraday_candidates,
     is_market_open,
     oi_wall_candidates,
+    relative_volume,
     remaining_sigma,
+    rvol_regime,
     scalp_setups,
     session_minutes_remaining,
+    volume_profile_candidates,
 )
 
 
@@ -119,6 +122,58 @@ class TestOiWalls:
         assert oi_wall_candidates(None, 746.0) == ([], None, "")
 
 
+class TestVolumeProfile:
+    def test_poc_at_heaviest_price(self):
+        today = bars([744.0] * 3 + [747.0] * 2 + [750.0] * 5)
+        today["Volume"] = [1_000_000] * 5 + [5_000_000] * 5
+        cands = volume_profile_candidates(today, 750.0)
+        poc = next(c for c in cands if c.source == "volume POC")
+        assert abs(poc.price - 750.0) < 1.2
+        assert "of session" in poc.detail
+
+    def test_secondary_node_survives(self):
+        # Heavy acceptance at 750 (POC) and a distinct node at 744.
+        today = bars([744.0] * 4 + [747.0] * 2 + [750.0] * 4)
+        today["Volume"] = [3_000_000] * 4 + [500_000] * 2 + [4_000_000] * 4
+        cands = volume_profile_candidates(today, 750.0)
+        nodes = [c for c in cands if c.source == "volume node"]
+        assert nodes and abs(nodes[0].price - 744.0) < 1.2
+
+    def test_too_little_dispersion(self):
+        today = bars([745.0] * 8)  # everything in one bin
+        assert volume_profile_candidates(today, 745.0) == []
+
+    def test_zero_volume(self):
+        today = bars([744.0, 747.0, 750.0], volume=0)
+        assert volume_profile_candidates(today, 750.0) == []
+
+
+class TestRvol:
+    def test_same_elapsed_bars(self):
+        today = bars([745.0] * 4)
+        today["Volume"] = [2_000_000] * 4
+        prior = bars([744.0] * 8, day=2)  # full prior session, 1M/bar
+        # baseline = first 4 prior bars (same elapsed), not the full day
+        assert relative_volume(today, [prior]) == pytest.approx(2.0)
+
+    def test_averages_multiple_sessions(self):
+        today = bars([745.0] * 4)  # 1M/bar -> 4M
+        p1 = bars([744.0] * 8, day=1)
+        p2 = bars([744.0] * 8, day=2)
+        p2["Volume"] = [3_000_000] * 8
+        # baseline = mean(4M, 12M) = 8M -> rvol 0.5
+        assert relative_volume(today, [p1, p2]) == pytest.approx(0.5)
+
+    def test_no_baseline(self):
+        assert relative_volume(bars([745.0] * 4), []) is None
+
+    def test_regime_bands(self):
+        assert "trend-day" in rvol_regime(1.8)
+        assert "quiet" in rvol_regime(0.5)
+        assert rvol_regime(1.0) == ""
+        assert rvol_regime(None) == ""
+
+
 class TestPickLevel:
     def test_confluence_beats_single_source(self):
         # Two weak sources clustered at ~744 outweigh one at 742.
@@ -194,7 +249,8 @@ class TestComputeScalpLevels:
         # Spot pinned at the session high with a far call wall: the wall is
         # the ceiling, the session high surfaces as the near ceiling.
         now = et(2026, 7, 6, 12, 0)
-        today = bars([748, 749, 750, 750.5, 751, 751.1, 751.0])
+        today = bars([748, 748.5, 749, 749.2, 749.5, 749.8,
+                      750.5, 751, 751.1, 751.05])
         chain = chain_df([745, 750, 755],
                          put_oi=[15_000, 5_000, 0],
                          call_oi=[0, 2_000, 12_000])
@@ -205,6 +261,28 @@ class TestComputeScalpLevels:
         assert "near ceiling" in msg and "break = room to 755.00" in msg
         d = lv.to_dict()
         assert d["near_ceiling"] == round(lv.near_ceiling, 2)
+
+    def test_trend_day_rvol_flags_counter_trend_fade(self):
+        now = et(2026, 7, 6, 12, 0)
+        today = bars([748, 749, 750, 750.5, 751, 751.1, 751.0])
+        today["Volume"] = [3_000_000] * len(today)  # 3x the prior pace
+        priors = [bars([747.0] * 78, day=d) for d in (1, 2)]
+        lv = compute_scalp_levels("SPY", 751.0, now, today, priors[-1], None,
+                                  iv=0.10, prior_sessions=priors)
+        assert lv.rvol == pytest.approx(3.0)
+        assert lv.rvol_sessions == 2
+        assert any("trend-day" in w for w in lv.warnings)
+        counter = [s for s in lv.setups if not s.with_trend]
+        assert counter and any("get-run-over" in n for n in counter[0].notes)
+        assert lv.to_dict()["rvol"] == 3.0
+
+    def test_rvol_falls_back_to_single_prior(self):
+        now = et(2026, 7, 6, 12, 0)
+        today = bars([748, 749, 750, 750.5])
+        prior = bars([747.0] * 78, day=2)
+        lv = compute_scalp_levels("SPY", 750.5, now, today, prior, None, iv=None)
+        assert lv.rvol == pytest.approx(1.0)
+        assert lv.rvol_sessions == 1
 
 
 def snapshot(spot=745.0, floor=740.0, ceiling=752.0, vwap=744.0,
