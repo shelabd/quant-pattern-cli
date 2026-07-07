@@ -16,8 +16,11 @@ from quant_patterns.scalp import (
     intraday_candidates,
     is_market_open,
     check_level_hits,
+    event_warnings,
     filter_new_hits,
     format_alert,
+    score_scalp_journal,
+    simulate_setup,
     oi_wall_candidates,
     relative_volume,
     remaining_sigma,
@@ -428,3 +431,110 @@ class TestLevelWatch:
         brk = check_level_hits(snap, 738.0)[0]
         text = format_alert("SPY", 738.0, brk)
         assert "BROKEN" in text and "invalidated" in text
+
+
+def ohlc(rows, day=6, start_h=10, start_m=0):
+    """Bars from explicit (high, low, close) rows, 5-minute spacing."""
+    idx = pd.date_range(et(2026, 7, day, start_h, start_m), periods=len(rows),
+                        freq="5min")
+    return pd.DataFrame({
+        "Open": [r[2] for r in rows], "High": [r[0] for r in rows],
+        "Low": [r[1] for r in rows], "Close": [r[2] for r in rows],
+        "Volume": [1_000_000] * len(rows),
+    }, index=idx)
+
+
+LONG_SETUP = {"side": "long", "trigger": 745.0, "stop": 744.25, "target1": 747.0}
+
+
+class TestSimulateSetup:
+    def test_no_trigger(self):
+        bars = ohlc([(746.5, 745.5, 746.0), (747.0, 746.0, 746.8)])
+        assert simulate_setup(LONG_SETUP, bars)["outcome"] == "no_trigger"
+
+    def test_target_win(self):
+        bars = ohlc([(746.0, 744.9, 745.5),   # fills at 745
+                     (747.2, 745.3, 747.0)])  # tags 747 target
+        res = simulate_setup(LONG_SETUP, bars)
+        assert res["outcome"] == "target"
+        assert res["r"] == pytest.approx(2.0 / 0.75)
+
+    def test_stop_loss(self):
+        bars = ohlc([(746.0, 744.9, 745.5), (745.5, 744.0, 744.1)])
+        res = simulate_setup(LONG_SETUP, bars)
+        assert res["outcome"] == "stop" and res["r"] == -1.0
+
+    def test_same_bar_stop_wins_tie(self):
+        # One wide bar spans entry, stop AND target: conservative = stop.
+        bars = ohlc([(747.5, 744.0, 746.0)])
+        assert simulate_setup(LONG_SETUP, bars)["outcome"] == "stop"
+
+    def test_eod_mark_to_close(self):
+        bars = ohlc([(746.0, 744.9, 745.5), (746.5, 745.4, 746.5)])
+        res = simulate_setup(LONG_SETUP, bars)
+        assert res["outcome"] == "eod"
+        assert res["r"] == pytest.approx(1.5 / 0.75)
+
+    def test_short_mirror(self):
+        setup = {"side": "short", "trigger": 752.0, "stop": 752.75, "target1": 750.0}
+        bars = ohlc([(752.2, 751.0, 751.5), (751.8, 749.8, 750.1)])
+        res = simulate_setup(setup, bars)
+        assert res["outcome"] == "target"
+        assert res["r"] == pytest.approx(2.0 / 0.75)
+
+
+class TestScoreScalpJournal:
+    def entry(self, asof_h=10, trigger=745.0, rvol=1.0, skip=""):
+        return {
+            "ticker": "SPY", "asof": f"2026-07-06T{asof_h:02d}:00:00-04:00",
+            "rvol": rvol,
+            "setups": [{"side": "long", "trigger": trigger, "stop": trigger - 0.75,
+                        "target1": trigger + 2.0, "with_trend": True,
+                        "skip_reason": skip}],
+        }
+
+    def winning_bars(self):
+        return ohlc([(746.0, 744.9, 745.5), (747.5, 745.3, 747.2)],
+                    start_h=10, start_m=30)
+
+    def test_scores_and_dedups_repeated_levels(self):
+        entries = [self.entry(10), self.entry(11)]  # same trigger twice
+        stats = score_scalp_journal(entries, lambda t, d: self.winning_bars())
+        assert stats["n_setups"] == 1
+        assert stats["overall"]["triggered"] == 1
+        assert stats["overall"]["win_rate"] == 1.0
+        assert stats["by_rvol"]["normal"]["n"] == 1
+
+    def test_pending_when_bars_unavailable(self):
+        stats = score_scalp_journal([self.entry()], lambda t, d: None)
+        assert stats["pending"] == 1 and stats["overall"]["n"] == 0
+
+    def test_stand_aside_bucketed_separately(self):
+        stats = score_scalp_journal([self.entry(skip="too tight")],
+                                    lambda t, d: self.winning_bars())
+        assert stats["overall"]["n"] == 0
+        assert stats["stand_aside"]["n"] == 1
+        assert stats["stand_aside"]["avg_r"] > 0
+
+    def test_only_bars_after_snapshot_count(self):
+        # Snapshot at 11:00 but the only touch was at 10:30 — no trigger.
+        entries = [self.entry(asof_h=11)]
+        stats = score_scalp_journal(entries, lambda t, d: self.winning_bars())
+        assert stats["overall"]["triggered"] == 0
+
+
+class TestEventWarnings:
+    def test_before_the_print(self):
+        warns = event_warnings([("CPI Release", "cpi")], et(2026, 7, 6, 8, 0))
+        assert len(warns) == 1 and "08:30" in warns[0] and "stand aside" in warns[0]
+
+    def test_just_after_the_print(self):
+        warns = event_warnings([("FOMC Decision", "fomc")], et(2026, 7, 6, 14, 30))
+        assert len(warns) == 1 and "digesting" in warns[0]
+
+    def test_digested_goes_quiet(self):
+        assert event_warnings([("CPI Release", "cpi")], et(2026, 7, 6, 11, 0)) == []
+
+    def test_unknown_category_always_warns(self):
+        warns = event_warnings([("OPEC Meeting", "opec")], et(2026, 7, 6, 11, 0))
+        assert len(warns) == 1 and "headline risk" in warns[0]

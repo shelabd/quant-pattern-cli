@@ -585,6 +585,161 @@ def format_message(lv: ScalpLevels) -> str:
     return "\n".join(lines)
 
 
+# ── Scheduled-event warnings ─────────────────────────────────────────────────
+
+# When the major prints hit the tape (ET). Categories not listed warn
+# without a time — headline risk with no clock on it.
+EVENT_PRINT_TIMES_ET = {
+    "cpi": time(8, 30),
+    "ppi": time(8, 30),
+    "nfp": time(8, 30),
+    "retail_sales": time(8, 30),
+    "gdp": time(8, 30),
+    "fomc": time(14, 0),
+}
+
+
+def event_warnings(events: list[tuple[str, str]], now_et: datetime) -> list[str]:
+    """Warnings for today's scheduled events: (name, category) pairs.
+
+    Levels are mean-reversion structure; a scheduled print steamrolls them.
+    Warn until the print, keep warning for an hour after (vol regime is
+    still the event's), go quiet once it's digested.
+    """
+    warns = []
+    for name, category in events:
+        t = EVENT_PRINT_TIMES_ET.get(category)
+        if t is None:
+            warns.append(f"{name} today — headline risk, levels unreliable around it")
+            continue
+        print_dt = now_et.replace(hour=t.hour, minute=t.minute,
+                                  second=0, microsecond=0)
+        past_min = (now_et - print_dt).total_seconds() / 60
+        if past_min < 0:
+            warns.append(f"{name} at {t.strftime('%H:%M')} ET — stand aside "
+                         "into the print, levels unreliable through it")
+        elif past_min < 60:
+            warns.append(f"{name} printed {t.strftime('%H:%M')} ET — "
+                         "still digesting, expect outsized moves")
+    return warns
+
+
+# ── Journal scoring (`qpat scalp --score`) ───────────────────────────────────
+
+def simulate_setup(setup: dict, bars: pd.DataFrame) -> dict:
+    """Mechanically replay one journaled setup against post-snapshot bars.
+
+    Limit entry at the trigger, then first-touch exits walked bar by bar.
+    Conservative on ties: a bar that spans both stop and target counts as a
+    stop, and the entry bar itself can stop the trade out. Returns
+    {outcome: no_trigger|stop|target|eod, r: R-multiple or None}.
+    """
+    side, trigger, stop = setup["side"], setup["trigger"], setup["stop"]
+    t1 = setup["target1"]
+    risk = abs(trigger - stop)
+    if risk <= 0:
+        return {"outcome": "no_trigger", "r": None}
+    in_pos = False
+    for _, bar in bars.iterrows():
+        if not in_pos:
+            touched = bar["Low"] <= trigger if side == "long" \
+                else bar["High"] >= trigger
+            if not touched:
+                continue
+            in_pos = True
+        stopped = bar["Low"] <= stop if side == "long" else bar["High"] >= stop
+        won = bar["High"] >= t1 if side == "long" else bar["Low"] <= t1
+        if stopped:
+            return {"outcome": "stop", "r": -1.0}
+        if won:
+            return {"outcome": "target", "r": abs(t1 - trigger) / risk}
+    if not in_pos:
+        return {"outcome": "no_trigger", "r": None}
+    close = float(bars["Close"].iloc[-1])
+    r = (close - trigger) / risk if side == "long" else (trigger - close) / risk
+    return {"outcome": "eod", "r": r}
+
+
+def _score_bucket(results: list[dict]) -> dict:
+    triggered = [r for r in results if r["r"] is not None]
+    wins = [r for r in triggered if r["r"] > 0]
+    stops = [r for r in triggered if r["outcome"] == "stop"]
+    n_t = len(triggered)
+    return {
+        "n": len(results),
+        "triggered": n_t,
+        "win_rate": round(len(wins) / n_t, 3) if n_t else None,
+        "stop_rate": round(len(stops) / n_t, 3) if n_t else None,
+        "avg_r": round(sum(r["r"] for r in triggered) / n_t, 2) if n_t else None,
+        "total_r": round(sum(r["r"] for r in triggered), 2) if n_t else None,
+    }
+
+
+def _rvol_band(rvol) -> str:
+    if rvol is None:
+        return "unknown"
+    if rvol >= RVOL_TREND:
+        return "trend"
+    if rvol <= RVOL_QUIET:
+        return "quiet"
+    return "normal"
+
+
+def score_scalp_journal(entries: list[dict], get_bars) -> dict:
+    """Score journaled snapshots by mechanically trading every setup.
+
+    ``get_bars(ticker, 'YYYY-MM-DD')`` returns that day's completed session
+    bars, or None while the session is still open/unavailable (those count
+    as pending). Consecutive 30-min snapshots repeating the same level are
+    deduped on (ticker, day, side, trigger) — one simulated trade each.
+    """
+    seen: set = set()
+    scored: list[dict] = []
+    pending = 0
+    for e in entries:
+        day = e["asof"][:10]
+        bars = get_bars(e["ticker"], day)
+        for s in e.get("setups", []):
+            key = (e["ticker"], day, s["side"], round(s["trigger"], 2))
+            if key in seen:
+                continue
+            seen.add(key)
+            if bars is None or bars.empty:
+                pending += 1
+                continue
+            after = bars[bars.index > pd.Timestamp(e["asof"])]
+            if after.empty:
+                continue
+            sim = simulate_setup(s, after)
+            scored.append({
+                **sim, "day": day, "side": s["side"],
+                "trigger": s["trigger"],
+                "with_trend": s.get("with_trend", True),
+                "stand_aside": bool(s.get("skip_reason")),
+                "rvol_band": _rvol_band(e.get("rvol")),
+            })
+
+    traded = [r for r in scored if not r["stand_aside"]]
+    stats = {
+        "n_setups": len(scored),
+        "pending": pending,
+        "days": len({r["day"] for r in scored}),
+        "overall": _score_bucket(traded),
+        "by_side": {side: _score_bucket([r for r in traded if r["side"] == side])
+                    for side in ("long", "short")},
+        "by_trend": {
+            "with_trend": _score_bucket([r for r in traded if r["with_trend"]]),
+            "counter_trend": _score_bucket([r for r in traded if not r["with_trend"]]),
+        },
+        "by_rvol": {band: _score_bucket([r for r in traded if r["rvol_band"] == band])
+                    for band in ("quiet", "normal", "trend", "unknown")},
+        # What the stand-aside filter avoided: negative avg_r here means the
+        # R:R gate is earning its keep.
+        "stand_aside": _score_bucket([r for r in scored if r["stand_aside"]]),
+    }
+    return stats
+
+
 # ── Level-touch watcher (between the 30-min updates) ────────────────────────
 
 def setup_from_dict(d: dict) -> ScalpSetup:

@@ -1440,6 +1440,56 @@ def display_scalp(lv) -> None:
     console.print()
 
 
+def display_scalp_score(ticker: str, stats: dict) -> None:
+    """Render the mechanically-replayed scalp setup scorecard."""
+    console.print(Rule(f"[bold cyan]⚡ {ticker} Scalp Forward-Test — "
+                       f"{stats['n_setups']} setups over {stats['days']} day(s)"))
+
+    def fmt(b: dict) -> list[str]:
+        if not b["triggered"]:
+            return [str(b["n"]), "0", "—", "—", "—", "—"]
+        return [str(b["n"]), str(b["triggered"]),
+                f"{b['win_rate']:.0%}", f"{b['stop_rate']:.0%}",
+                f"{b['avg_r']:+.2f}R", f"{b['total_r']:+.2f}R"]
+
+    t = Table(box=box.SIMPLE_HEAVY)
+    t.add_column("Bucket", style="bold")
+    for col in ("setups", "triggered", "win", "stopped", "avg", "total"):
+        t.add_column(col, justify="right")
+    t.add_row("all traded", *fmt(stats["overall"]))
+    t.add_section()
+    t.add_row("long (floor bounce)", *fmt(stats["by_side"]["long"]))
+    t.add_row("short (ceiling fade)", *fmt(stats["by_side"]["short"]))
+    t.add_section()
+    t.add_row("with trend", *fmt(stats["by_trend"]["with_trend"]))
+    t.add_row("counter-trend", *fmt(stats["by_trend"]["counter_trend"]))
+    t.add_section()
+    for band, label in (("quiet", "RVOL quiet (≤0.7×)"), ("normal", "RVOL normal"),
+                        ("trend", "RVOL trend (≥1.5×)"), ("unknown", "RVOL unknown")):
+        b = stats["by_rvol"][band]
+        if b["n"]:
+            t.add_row(label, *fmt(b))
+    sa = stats["stand_aside"]
+    if sa["n"]:
+        t.add_section()
+        t.add_row("stand-asides (not traded)", *fmt(sa))
+    console.print(t)
+
+    if sa["n"] and sa["triggered"] and sa["avg_r"] is not None:
+        verdict = ("saving money" if sa["avg_r"] < 0 else
+                   "costing opportunity — consider loosening MIN_RR")
+        console.print(f"  [dim]Stand-aside filter would have averaged "
+                      f"{sa['avg_r']:+.2f}R → {verdict}.[/dim]")
+    if stats["pending"]:
+        console.print(f"  [dim]{stats['pending']} setup(s) pending — "
+                      "session incomplete or bars unavailable.[/dim]")
+    console.print(Text("  Mechanical replay: limit entry at trigger, stop/T1 "
+                       "first-touch, stop wins same-bar ties, open trades "
+                       "marked to close. Fills are optimistic (no slippage).",
+                       style="dim"))
+    console.print()
+
+
 # ── Fly Forward-Test Journal ─────────────────────────────────────────────────
 
 def display_journal(scored: list, pending: list, stats: dict) -> None:

@@ -2183,7 +2183,10 @@ SCALP_LOG_PATH = Path.home() / ".qpat" / "scalp_journal.jsonl"
               help="Scheduler mode: exit silently when the US market is closed")
 @click.option("--log/--no-log", "do_log", default=True,
               help="Append each snapshot to ~/.qpat/scalp_journal.jsonl")
-def scalp(ticker, as_json, do_notify, cron, do_log):
+@click.option("--score", "do_score", is_flag=True,
+              help="Score the journaled snapshots: mechanically replay every "
+                   "setup against what price did next")
+def scalp(ticker, as_json, do_notify, cron, do_log, do_score):
     """Intraday scalp floor & ceiling for TICKER (default SPY).
 
     Levels combine nearest-expiry OI walls, the ATM-IV expected move over
@@ -2198,10 +2201,23 @@ def scalp(ticker, as_json, do_notify, cron, do_log):
 
     ticker = ticker.upper()
     now_et = datetime.now(ET)
+    if do_score:
+        _scalp_score(ticker, now_et, as_json)
+        return
     if cron and not is_market_open(now_et):
         return
 
     warnings: list[str] = []
+    # Scheduled prints steamroll mean-reversion levels — warn first.
+    try:
+        from .events import EventCatalog
+        from .scalp import event_warnings
+        todays = EventCatalog().search(ticker=ticker, start=now_et.date(),
+                                       end=now_et.date())
+        warnings.extend(event_warnings(
+            [(ev.name, ev.category.value) for ev in todays], now_et))
+    except Exception:
+        pass  # a broken calendar must never block the levels
     try:
         # ~5 prior sessions: structure levels use just the last one, the
         # RVOL baseline averages them all.
@@ -2268,6 +2284,47 @@ def scalp(ticker, as_json, do_notify, cron, do_log):
             else:
                 console.print(f"[red]{e}[/red]")
             sys.exit(1)
+
+
+def _scalp_score(ticker: str, now_et, as_json: bool) -> None:
+    """Replay every journaled scalp setup against actual price history."""
+    from .data import YFinanceProvider
+    from .scalp import SESSION_CLOSE, score_scalp_journal
+
+    entries = []
+    if SCALP_LOG_PATH.exists():
+        for line in SCALP_LOG_PATH.read_text().splitlines():
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if d.get("ticker") == ticker and d.get("setups"):
+                entries.append(d)
+    if not entries:
+        console.print(f"[yellow]No journaled {ticker} scalp setups yet — "
+                      "the 30-min cron fills ~/.qpat/scalp_journal.jsonl.[/yellow]")
+        return
+
+    first_day = date.fromisoformat(entries[0]["asof"][:10])
+    span = min(59, (now_et.date() - first_day).days + 2)  # 5m bars: 60d limit
+    bars = YFinanceProvider().get_intraday_ohlcv(ticker, days=span)
+    by_day = {d.isoformat(): bars[bars.index.date == d]
+              for d in set(bars.index.date)}
+    # Today's session only scores once it's complete.
+    session_over = now_et.time() >= SESSION_CLOSE
+    today = now_et.date().isoformat()
+
+    def get_bars(tkr, day):
+        if day == today and not session_over:
+            return None
+        return by_day.get(day)
+
+    stats = score_scalp_journal(entries, get_bars)
+    if as_json:
+        click.echo(json.dumps(stats, indent=2))
+    else:
+        from .display import display_scalp_score
+        display_scalp_score(ticker, stats)
 
 
 SCALP_WATCH_STATE = Path.home() / ".qpat" / "scalp_watch_state.json"

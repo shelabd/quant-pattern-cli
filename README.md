@@ -190,10 +190,18 @@ session via launchd with `--notify --cron`:
 
 | Flag | Description |
 |------|-------------|
+On days with a scheduled macro print (CPI, FOMC, NFP…) the message leads
+with a warning — "stand aside into the print" — because scheduled events
+steamroll mean-reversion levels; it keeps warning for an hour after the
+print, then goes quiet.
+
+| Flag | Description |
+|------|-------------|
 | `--notify` | Send the levels to Telegram (`qpat config set telegram-bot-token` / `telegram-chat-id`) |
 | `--cron` | Scheduler mode: exit silently when the US market is closed |
 | `--json` | Machine-readable output |
 | `--no-log` | Skip the jsonl snapshot log |
+| `--score` | Forward-test scorecard: mechanically replay every journaled setup (limit entry at the trigger, stop/T1 first-touch, stop wins same-bar ties, EOD mark-to-close) and report win/stop rates and R by side, trend alignment, and RVOL band — plus whether the stand-aside filter is saving money |
 
 ```bash
 qpat scalp                    # SPY levels right now
