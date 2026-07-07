@@ -1483,10 +1483,11 @@ def events_add(name, event_date, category, description, ticker):
 @events.command("sync-calendar")
 @click.option("--force", "-f", is_flag=True, default=False, help="Force refresh (ignore cache TTL)")
 def events_sync_calendar(force):
-    """Sync macro calendar from FRED API + FOMC schedule.
+    """Sync macro calendar from FRED API + the Fed's FOMC schedule.
 
     Fetches upcoming release dates for CPI, PPI, NFP, GDP, Retail Sales
-    from FRED, plus hardcoded FOMC dates. Results are cached for 24 hours.
+    from FRED, plus FOMC announcement dates live from federalreserve.gov
+    (hardcoded fallback if the fetch fails). Results are cached for 24 hours.
 
     Requires a FRED API key — set via: qpat config set fred-api-key <KEY>
     """
@@ -1495,7 +1496,7 @@ def events_sync_calendar(force):
     api_key = get_fred_api_key()
     if not api_key:
         console.print("[yellow]⚠ No FRED API key configured.[/yellow]")
-        console.print("  FOMC dates are always available (hardcoded).")
+        console.print("  FOMC dates still sync (fetched from federalreserve.gov).")
         console.print("  For CPI/PPI/NFP/GDP/Retail Sales, run:")
         console.print("  [cyan]qpat config set fred-api-key <YOUR_KEY>[/cyan]\n")
 
@@ -1516,6 +1517,15 @@ def events_sync_calendar(force):
             console.print(f"    {d}")
         if len(upcoming) > 3:
             console.print(f"    ... and {len(upcoming) - 3} more")
+
+    # A shrinking FOMC horizon means the live fetch has been failing and the
+    # fallback list is running out — say so before it goes silent.
+    fomc = releases.get("fomc", [])
+    horizon = max(fomc) if fomc else None
+    if horizon is None or horizon < (date.today() + timedelta(days=90)).isoformat():
+        console.print(f"[yellow]⚠ FOMC schedule only extends to {horizon or 'nothing'} — "
+                      "the federalreserve.gov fetch is likely failing; event warnings "
+                      "will degrade past that date.[/yellow]")
     console.print()
 
 

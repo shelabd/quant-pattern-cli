@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
@@ -47,8 +48,11 @@ IMPACT_RANK: dict[EventCategory, int] = {
     EventCategory.RETAIL_SALES: 6,
 }
 
-# FOMC meeting dates (announcement day) — sourced from the Fed's published schedule
-FOMC_DATES_2025_2026: list[date] = [
+# FOMC meeting dates (announcement day) — FALLBACK ONLY, used when the live
+# fetch from the Fed's calendar page fails. Snapshot of the published
+# schedule; the live page is authoritative (it revealed this list's Dec 2026
+# entry was stale the day the fetch was added).
+FOMC_DATES_FALLBACK: list[date] = [
     # 2025
     date(2025, 1, 29),
     date(2025, 3, 19),
@@ -130,10 +134,81 @@ def fetch_fred_release_dates(
 
 # ── FOMC dates ────────────────────────────────────────────────────────────────
 
+FOMC_CAL_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+
+# Document-order token stream: year headings ("2026 FOMC Meetings") precede
+# their meetings; each meeting is a __month div followed by a __date div.
+_FOMC_TOKEN_RE = re.compile(
+    r"(\d{4})\s+FOMC\s+Meetings"
+    r"|fomc-meeting__month[^>]*>\s*(?:<strong>)?\s*([^<]+)"
+    r"|fomc-meeting__date[^>]*>\s*([^<]+)"
+)
+
+
+def _parse_fomc_meeting(year: int, month_name: str, date_text: str) -> Optional[date]:
+    """One meeting row -> announcement date (the meeting's LAST day).
+
+    Handles "27-28", "17-18*" (SEP asterisk), "22 (notation vote)", and
+    cross-month rows like "October/November" "31-1" (announcement falls in
+    the second month when the day range wraps).
+    """
+    days = [int(n) for n in re.findall(r"\d+", date_text.split("(")[0])]
+    if not days:
+        return None
+    months = [p.strip() for p in month_name.split("/")]
+    wraps = len(days) > 1 and days[-1] < days[0]
+    name = months[-1] if (len(months) > 1 and wraps) else months[0]
+    try:
+        month = datetime.strptime(name[:3], "%b").month
+        return date(year, month, days[-1])
+    except ValueError:
+        return None
+
+
+def parse_fomc_calendar(html: str) -> list[date]:
+    """Extract FOMC announcement dates from the Fed's calendar page HTML.
+
+    Pure and offline-testable. Year panels appear in arbitrary order
+    (current year first), so the year heading resets the running state.
+    """
+    year: Optional[int] = None
+    month_name: Optional[str] = None
+    found: set[date] = set()
+    for y, m, d in _FOMC_TOKEN_RE.findall(html):
+        if y:
+            year, month_name = int(y), None
+        elif m:
+            month_name = m.strip()
+        elif d and year and month_name:
+            parsed = _parse_fomc_meeting(year, month_name, d)
+            if parsed:
+                found.add(parsed)
+            month_name = None
+    return sorted(found)
+
+
+def fetch_fomc_dates_from_fed(timeout: int = 10) -> list[date]:
+    """Live FOMC schedule from federalreserve.gov (~5y history + the next
+    year's tentative schedule). Raises on fetch/parse failure."""
+    req = urllib.request.Request(FOMC_CAL_URL, headers={"User-Agent": "qpat/0.1"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+    dates = parse_fomc_calendar(html)
+    if not dates:
+        raise ValueError("no FOMC meetings parsed from the Fed calendar page")
+    return dates
+
 
 def get_fomc_dates() -> list[date]:
-    """Return hardcoded FOMC announcement dates for 2025-2026."""
-    return list(FOMC_DATES_2025_2026)
+    """FOMC announcement dates: live from the Fed's published calendar,
+    hardcoded fallback only when the fetch or parse fails. Results land in
+    the 24h macro cache, so the Fed page is hit at most once a day."""
+    try:
+        return fetch_fomc_dates_from_fed()
+    except Exception as e:
+        logger.warning("FOMC calendar fetch failed (%s) — using hardcoded "
+                       "fallback through %s", e, FOMC_DATES_FALLBACK[-1])
+        return list(FOMC_DATES_FALLBACK)
 
 
 # ── Earnings via yfinance ─────────────────────────────────────────────────────
