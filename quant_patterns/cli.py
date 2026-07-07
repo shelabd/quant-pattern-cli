@@ -2270,6 +2270,88 @@ def scalp(ticker, as_json, do_notify, cron, do_log):
             sys.exit(1)
 
 
+SCALP_WATCH_STATE = Path.home() / ".qpat" / "scalp_watch_state.json"
+
+
+@cli.command("scalp-watch")
+@click.argument("ticker", default="SPY")
+@click.option("--cron", is_flag=True,
+              help="Scheduler mode: exit silently when the US market is closed")
+@click.option("--notify/--no-notify", "do_notify", default=True,
+              help="Send touch/break alerts to Telegram (default on)")
+def scalp_watch(ticker, cron, do_notify):
+    """Alert when price touches the latest scalp floor or ceiling.
+
+    Reads the most recent `qpat scalp` snapshot from the journal and
+    compares it to the live price — no chain fetch, cheap enough to run
+    every 2 minutes via launchd between the 30-minute level updates.
+    One alert per level per day; a break beyond the stop alerts separately.
+    """
+    from .data import YFinanceProvider
+    from .scalp import (ET, check_level_hits, filter_new_hits, format_alert,
+                        is_market_open)
+
+    ticker = ticker.upper()
+    now_et = datetime.now(ET)
+    if cron and not is_market_open(now_et):
+        return
+
+    snapshot = None
+    if SCALP_LOG_PATH.exists():
+        for line in reversed(SCALP_LOG_PATH.read_text().splitlines()):
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("ticker") == ticker:
+                snapshot = entry
+                break
+    today = now_et.date().isoformat()
+    if snapshot is None or snapshot["asof"][:10] != today:
+        # No levels logged yet today (cron hasn't fired / holiday).
+        if not cron:
+            console.print("[yellow]No scalp snapshot for "
+                          f"{ticker} today — run `qpat scalp {ticker}` first.[/yellow]")
+        return
+
+    try:
+        price = YFinanceProvider().get_last_price(ticker)
+    except Exception as e:
+        click.echo(f"scalp-watch: price fetch failed: {e}", err=True)
+        sys.exit(1)
+
+    hits = check_level_hits(snapshot, price)
+    state = {}
+    if SCALP_WATCH_STATE.exists():
+        try:
+            state = json.loads(SCALP_WATCH_STATE.read_text())
+        except json.JSONDecodeError:
+            state = {}
+    new_hits, state = filter_new_hits(hits, state, today)
+    SCALP_WATCH_STATE.parent.mkdir(parents=True, exist_ok=True)
+    SCALP_WATCH_STATE.write_text(json.dumps(state))
+
+    asof_hhmm = snapshot["asof"][11:16]
+    if not cron:
+        floor, ceiling = snapshot.get("floor"), snapshot.get("ceiling")
+        console.print(f"{ticker} {price:.2f} — floor {floor}, ceiling {ceiling} "
+                      f"(levels {asof_hhmm} ET); "
+                      + (f"{len(new_hits)} new alert(s)" if new_hits else "no touch"))
+    if not new_hits:
+        return
+    for hit in new_hits:
+        text = format_alert(ticker, price, hit, asof=f"{asof_hhmm} ET")
+        if not cron:
+            console.print(text)
+        if do_notify:
+            from .notify import TelegramError, send_telegram
+            try:
+                send_telegram(text)
+            except TelegramError as e:
+                click.echo(f"scalp-watch: {e}", err=True)
+                sys.exit(1)
+
+
 # ── JOURNAL command ─────────────────────────────────────────────────────────────
 
 @cli.command()

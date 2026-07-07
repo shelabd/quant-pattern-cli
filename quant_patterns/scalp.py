@@ -585,6 +585,99 @@ def format_message(lv: ScalpLevels) -> str:
     return "\n".join(lines)
 
 
+# ── Level-touch watcher (between the 30-min updates) ────────────────────────
+
+def setup_from_dict(d: dict) -> ScalpSetup:
+    """Rebuild a ScalpSetup from its journaled to_dict() form."""
+    return ScalpSetup(
+        side=d["side"], trigger=d["trigger"], trigger_label=d["trigger_label"],
+        entry_lo=d["entry_zone"][0], entry_hi=d["entry_zone"][1],
+        stop=d["stop"], target1=d["target1"], target1_label=d["target1_label"],
+        rr1=d["rr1"], target2=d.get("target2"),
+        target2_label=d.get("target2_label", ""), rr2=d.get("rr2"),
+        with_trend=d.get("with_trend", True), notes=list(d.get("notes", [])),
+        skip_reason=d.get("skip_reason", ""),
+    )
+
+
+def check_level_hits(snapshot: dict, price: float) -> list[dict]:
+    """Compare a live price against a journaled snapshot's main levels.
+
+    A *touch* fires when price enters the level's entry zone (the
+    actionable moment); a *break* when it trades beyond the setup's stop
+    (the plan is invalidated — the other side of the trade is in play).
+    Near levels are deliberately not watched: VWAP gets touched constantly.
+    """
+    setups = {s["side"]: s for s in snapshot.get("setups", [])}
+    hits: list[dict] = []
+
+    floor = snapshot.get("floor")
+    if floor is not None:
+        long_setup = setups.get("long")
+        zone_hi = long_setup["entry_zone"][1] if long_setup \
+            else floor * (1 + ENTRY_ZONE_PCT / 100)
+        stop = long_setup["stop"] if long_setup \
+            else floor * (1 - STOP_BUFFER_PCT / 100)
+        if price < stop:
+            hits.append({"side": "floor", "kind": "break",
+                         "level": floor, "setup": long_setup})
+        elif price <= zone_hi:
+            hits.append({"side": "floor", "kind": "touch",
+                         "level": floor, "setup": long_setup})
+
+    ceiling = snapshot.get("ceiling")
+    if ceiling is not None:
+        short_setup = setups.get("short")
+        zone_lo = short_setup["entry_zone"][0] if short_setup \
+            else ceiling * (1 - ENTRY_ZONE_PCT / 100)
+        stop = short_setup["stop"] if short_setup \
+            else ceiling * (1 + STOP_BUFFER_PCT / 100)
+        if price > stop:
+            hits.append({"side": "ceiling", "kind": "break",
+                         "level": ceiling, "setup": short_setup})
+        elif price >= zone_lo:
+            hits.append({"side": "ceiling", "kind": "touch",
+                         "level": ceiling, "setup": short_setup})
+    return hits
+
+
+def filter_new_hits(
+    hits: list[dict], state: dict, today: str,
+) -> tuple[list[dict], dict]:
+    """Dedup: one alert per (side, kind, level) per day. A new 30-min
+    snapshot that moves a level re-arms its alert automatically because the
+    level price is part of the key. Returns (new hits, updated state)."""
+    if state.get("date") != today:
+        state = {"date": today, "alerted": []}
+    seen = set(state.get("alerted", []))
+    fresh = []
+    for h in hits:
+        key = f"{h['side']}:{h['kind']}:{h['level']:.2f}"
+        if key not in seen:
+            fresh.append(h)
+            seen.add(key)
+    return fresh, {"date": today, "alerted": sorted(seen)}
+
+
+def format_alert(ticker: str, price: float, hit: dict, asof: str = "") -> str:
+    """Telegram text for one level touch/break."""
+    side, kind, level = hit["side"], hit["kind"], hit["level"]
+    if kind == "break":
+        beyond = "below" if side == "floor" else "above"
+        lines = [f"🚨 {ticker} {price:.2f} — {side.upper()} {level:.2f} BROKEN",
+                 f"Price is {beyond} the stop: the {side}-fade plan is "
+                 "invalidated, momentum is in control."]
+    else:
+        lines = [f"🔔 {ticker} {price:.2f} — at the {side.upper()} {level:.2f}"]
+        setup = hit.get("setup")
+        if setup:
+            s = setup_from_dict(setup)
+            lines.append(format_setup(s))
+    if asof:
+        lines.append(f"(levels from the {asof} update)")
+    return "\n".join(lines)
+
+
 def format_setup(s: ScalpSetup) -> str:
     """One setup as compact Telegram-friendly lines."""
     arrow = "🟢 LONG" if s.side == "long" else "🔴 SHORT"

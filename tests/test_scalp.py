@@ -15,6 +15,9 @@ from quant_patterns.scalp import (
     format_message,
     intraday_candidates,
     is_market_open,
+    check_level_hits,
+    filter_new_hits,
+    format_alert,
     oi_wall_candidates,
     relative_volume,
     remaining_sigma,
@@ -355,3 +358,73 @@ class TestScalpSetups:
         d = lv.to_dict()
         assert len(d["setups"]) == 2
         assert {"side", "entry_zone", "stop", "target1", "rr2"} <= set(d["setups"][0])
+
+
+def watch_snapshot():
+    """A journaled snapshot as scalp-watch reads it (post-to_dict JSON)."""
+    lv = snapshot()  # floor 740, ceiling 752, spot 745
+    lv.setups = scalp_setups(lv)
+    return lv.to_dict()
+
+
+class TestLevelWatch:
+    def test_no_hit_mid_range(self):
+        assert check_level_hits(watch_snapshot(), 746.0) == []
+
+    def test_floor_touch_inside_entry_zone(self):
+        snap = watch_snapshot()
+        zone_hi = next(s for s in snap["setups"] if s["side"] == "long")["entry_zone"][1]
+        hits = check_level_hits(snap, zone_hi - 0.01)
+        assert [(h["side"], h["kind"]) for h in hits] == [("floor", "touch")]
+        assert hits[0]["setup"]["side"] == "long"
+
+    def test_floor_break_below_stop(self):
+        snap = watch_snapshot()
+        stop = next(s for s in snap["setups"] if s["side"] == "long")["stop"]
+        hits = check_level_hits(snap, stop - 0.05)
+        assert [(h["side"], h["kind"]) for h in hits] == [("floor", "break")]
+
+    def test_ceiling_touch_and_break(self):
+        snap = watch_snapshot()
+        short = next(s for s in snap["setups"] if s["side"] == "short")
+        assert check_level_hits(snap, short["entry_zone"][0] + 0.01)[0]["kind"] == "touch"
+        assert check_level_hits(snap, short["stop"] + 0.05)[0]["kind"] == "break"
+
+    def test_falls_back_to_levels_without_setups(self):
+        snap = {"floor": 740.0, "ceiling": 752.0, "setups": []}
+        assert check_level_hits(snap, 740.1)[0]["kind"] == "touch"
+        assert check_level_hits(snap, 738.0)[0]["kind"] == "break"
+
+    def test_dedup_once_per_day(self):
+        hits = check_level_hits(watch_snapshot(), 740.0)
+        fresh, state = filter_new_hits(hits, {}, "2026-07-07")
+        assert len(fresh) == 1
+        again, state = filter_new_hits(hits, state, "2026-07-07")
+        assert again == []
+        # a break at the same level is a different alert
+        breaks = check_level_hits(watch_snapshot(), 738.0)
+        fresh2, state = filter_new_hits(breaks, state, "2026-07-07")
+        assert len(fresh2) == 1
+
+    def test_dedup_resets_next_day(self):
+        hits = check_level_hits(watch_snapshot(), 740.0)
+        _, state = filter_new_hits(hits, {}, "2026-07-07")
+        fresh, _ = filter_new_hits(hits, state, "2026-07-08")
+        assert len(fresh) == 1
+
+    def test_moved_level_rearms(self):
+        hits = check_level_hits(watch_snapshot(), 740.0)
+        _, state = filter_new_hits(hits, {}, "2026-07-07")
+        moved = [dict(hits[0], level=741.5)]
+        fresh, _ = filter_new_hits(moved, state, "2026-07-07")
+        assert len(fresh) == 1
+
+    def test_alert_text(self):
+        snap = watch_snapshot()
+        touch = check_level_hits(snap, 740.0)[0]
+        text = format_alert("SPY", 740.0, touch, asof="15:00 ET")
+        assert "🔔" in text and "FLOOR 740.00" in text
+        assert "stop" in text and "15:00 ET" in text
+        brk = check_level_hits(snap, 738.0)[0]
+        text = format_alert("SPY", 738.0, brk)
+        assert "BROKEN" in text and "invalidated" in text

@@ -91,6 +91,26 @@ class YFinanceProvider(DataProvider):
         df.index = pd.to_datetime(df.index).tz_convert("America/New_York")
         return df[["Open", "High", "Low", "Close", "Volume"]].copy()
 
+    def get_last_price(self, ticker: str) -> float:
+        """Latest traded price, as cheap as yfinance allows.
+
+        Used by `qpat scalp-watch`, which runs every couple of minutes —
+        fast_info is a single quote lookup; the 1-minute-bar fallback covers
+        tickers where fast_info comes back empty.
+        """
+        tk = yf.Ticker(ticker)
+        try:
+            price = tk.fast_info["last_price"]
+            if price and price > 0:
+                return float(price)
+        except (KeyError, TypeError, ValueError):
+            pass
+        df = tk.history(period="1d", interval="1m", auto_adjust=True,
+                        prepost=False)
+        if df.empty:
+            raise ValueError(f"No price data returned for {ticker}")
+        return float(df["Close"].iloc[-1])
+
 
 class IBKRProvider(DataProvider):
     """
