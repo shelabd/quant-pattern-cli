@@ -2347,16 +2347,19 @@ SCALP_WATCH_STATE = Path.home() / ".qpat" / "scalp_watch_state.json"
 @click.option("--notify/--no-notify", "do_notify", default=True,
               help="Send touch/break alerts to Telegram (default on)")
 def scalp_watch(ticker, cron, do_notify):
-    """Alert when price touches the latest scalp floor or ceiling.
+    """Alert when price nears or touches the latest scalp floor or ceiling.
 
     Reads the most recent `qpat scalp` snapshot from the journal and
     compares it to the live price — no chain fetch, cheap enough to run
-    every 2 minutes via launchd between the 30-minute level updates.
-    One alert per level per day; a break beyond the stop alerts separately.
+    every minute via launchd between the 30-minute level updates.
+    An approach heads-up fires while price is still on its way (with an
+    ETA from the last poll's pace) so the order can be staged early; the
+    touch and stop-break alerts confirm. Touch/break alert once per level
+    per day; an approach re-arms after price retreats from the level.
     """
     from .data import YFinanceProvider
-    from .scalp import (ET, check_level_hits, filter_new_hits, format_alert,
-                        is_market_open)
+    from .scalp import (ET, approach_eta, check_level_hits, filter_new_hits,
+                        format_alert, is_market_open, rearm_approaches)
 
     ticker = ticker.upper()
     now_et = datetime.now(ET)
@@ -2387,14 +2390,27 @@ def scalp_watch(ticker, cron, do_notify):
         click.echo(f"scalp-watch: price fetch failed: {e}", err=True)
         sys.exit(1)
 
-    hits = check_level_hits(snapshot, price)
     state = {}
     if SCALP_WATCH_STATE.exists():
         try:
             state = json.loads(SCALP_WATCH_STATE.read_text())
         except json.JSONDecodeError:
             state = {}
+    # Last poll's price feeds approach direction + pace; only trust it
+    # within the same session.
+    last = state.get("last") if state.get("date") == today else None
+    now_ts = now_et.timestamp()
+    hits = check_level_hits(snapshot, price,
+                            last_price=last["price"] if last else None)
+    if last:
+        minutes = (now_ts - last["ts"]) / 60
+        for h in hits:
+            if h["kind"] == "approach":
+                h["eta_min"] = approach_eta(price, last["price"],
+                                            h["level"], minutes)
+    state = rearm_approaches(state, price)
     new_hits, state = filter_new_hits(hits, state, today)
+    state["last"] = {"ts": now_ts, "price": price}
     SCALP_WATCH_STATE.parent.mkdir(parents=True, exist_ok=True)
     SCALP_WATCH_STATE.write_text(json.dumps(state))
 

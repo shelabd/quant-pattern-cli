@@ -15,10 +15,12 @@ from quant_patterns.scalp import (
     format_message,
     intraday_candidates,
     is_market_open,
+    approach_eta,
     check_level_hits,
     event_warnings,
     filter_new_hits,
     format_alert,
+    rearm_approaches,
     score_scalp_journal,
     simulate_setup,
     oi_wall_candidates,
@@ -431,6 +433,85 @@ class TestLevelWatch:
         brk = check_level_hits(snap, 738.0)[0]
         text = format_alert("SPY", 738.0, brk)
         assert "BROKEN" in text and "invalidated" in text
+
+
+class TestApproachAlerts:
+    # watch_snapshot: floor 740 (zone hi ~740.37, band to ~741.85),
+    # ceiling 752 (zone lo ~751.62, band to ~750.12).
+
+    def test_floor_approach_while_falling(self):
+        hits = check_level_hits(watch_snapshot(), 741.0, last_price=741.5)
+        assert [(h["side"], h["kind"]) for h in hits] == [("floor", "approach")]
+        assert hits[0]["distance_pct"] == pytest.approx(1.0 / 740 * 100)
+        assert hits[0]["setup"]["side"] == "long"
+
+    def test_silent_when_moving_away(self):
+        assert check_level_hits(watch_snapshot(), 741.0, last_price=740.6) == []
+
+    def test_flat_price_inside_band_alerts(self):
+        hits = check_level_hits(watch_snapshot(), 741.0, last_price=741.0)
+        assert hits[0]["kind"] == "approach"
+
+    def test_first_sighting_without_history_alerts(self):
+        hits = check_level_hits(watch_snapshot(), 741.0)
+        assert hits[0]["kind"] == "approach"
+
+    def test_ceiling_approach_while_rising(self):
+        hits = check_level_hits(watch_snapshot(), 750.5, last_price=750.1)
+        assert [(h["side"], h["kind"]) for h in hits] == [("ceiling", "approach")]
+        assert hits[0]["setup"]["side"] == "short"
+
+    def test_mid_range_stays_silent(self):
+        assert check_level_hits(watch_snapshot(), 745.0, last_price=744.0) == []
+
+    def test_touch_supersedes_approach(self):
+        snap = watch_snapshot()
+        zone_hi = next(s for s in snap["setups"]
+                       if s["side"] == "long")["entry_zone"][1]
+        hits = check_level_hits(snap, zone_hi - 0.01, last_price=zone_hi + 0.5)
+        assert [h["kind"] for h in hits] == ["touch"]
+
+    def test_eta_from_pace(self):
+        # closed 0.5 in 1 min, 1.0 still to go -> ~2 min out
+        assert approach_eta(741.0, 741.5, 740.0, 1.0) == pytest.approx(2.0)
+
+    def test_eta_none_when_not_closing_or_no_interval(self):
+        assert approach_eta(741.5, 741.0, 740.0, 1.0) is None
+        assert approach_eta(741.0, 741.5, 740.0, 0.0) is None
+
+    def test_rearm_drops_only_far_approach_keys(self):
+        state = {"date": "2026-07-08",
+                 "alerted": ["floor:approach:740.00", "floor:touch:740.00"]}
+        far = rearm_approaches(state, 745.0)   # 0.68% away > 0.50 re-arm
+        assert far["alerted"] == ["floor:touch:740.00"]
+        near = rearm_approaches(state, 741.0)  # still in the neighborhood
+        assert near["alerted"] == state["alerted"]
+
+    def test_approach_realerts_after_retreat(self):
+        snap = watch_snapshot()
+        day = "2026-07-08"
+        hits = check_level_hits(snap, 741.0, last_price=741.5)
+        fresh, state = filter_new_hits(hits, {}, day)
+        assert len(fresh) == 1
+        again, state = filter_new_hits(hits, state, day)   # hovering: deduped
+        assert again == []
+        state = rearm_approaches(state, 745.0)             # bounced away
+        back, _ = filter_new_hits(hits, state, day)        # second run at it
+        assert len(back) == 1
+
+    def test_approach_alert_text(self):
+        hit = check_level_hits(watch_snapshot(), 741.0, last_price=741.5)[0]
+        hit["eta_min"] = 2.4
+        text = format_alert("SPY", 741.0, hit, asof="15:00 ET")
+        assert "⏳" in text and "FLOOR" in text and "740.00" in text
+        assert "% away" in text and "~2 min" in text
+        assert "stage the order" in text and "stop" in text
+
+    def test_approach_alert_text_hides_meaningless_eta(self):
+        hit = check_level_hits(watch_snapshot(), 741.0)[0]
+        assert "min." not in format_alert("SPY", 741.0, hit)
+        hit["eta_min"] = 120.0  # slow drift: pace says nothing useful
+        assert "min." not in format_alert("SPY", 741.0, hit)
 
 
 def ohlc(rows, day=6, start_h=10, start_m=0):

@@ -210,13 +210,17 @@ qpat scalp SPY --notify --cron   # what the 30-min launchd job runs
 ```
 
 ### `qpat scalp-watch [TICKER]`
-**Level-touch alerts between the 30-minute updates.** Reads the latest
+**Level alerts between the 30-minute updates.** Reads the latest
 journaled `scalp` snapshot and compares it to the live price — no chain
 fetch, so it's cheap enough to run every 60 seconds via launchd. Sends a
-Telegram **touch** alert (with the full entry/stop/target plan) when price
-enters a level's entry zone, and a **break** alert when price trades beyond
-the setup's stop (the fade plan is invalidated). One alert per level per
-day; when a 30-minute update moves a level, its alert re-arms.
+Telegram **approach** heads-up while price is still on its way to a level
+(within 0.25% and not moving away, with an ETA from the last poll's pace
+and the full plan, so the order can be staged before the level trades), a
+**touch** alert when price enters the entry zone, and a **break** alert
+when price trades beyond the setup's stop (the fade plan is invalidated).
+Touch/break alert once per level per day; an approach re-arms after price
+retreats 0.5% from the level, so a later second run at it pings again.
+When a 30-minute update moves a level, all its alerts re-arm.
 
 | Flag | Description |
 |------|-------------|

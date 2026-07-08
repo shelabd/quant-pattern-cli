@@ -742,6 +742,14 @@ def score_scalp_journal(entries: list[dict], get_bars) -> dict:
 
 # ── Level-touch watcher (between the 30-min updates) ────────────────────────
 
+# Heads-up alert when price is this close to a level (%) and headed there —
+# the touch alert alone arrives when the bounce is already underway.
+APPROACH_PCT = 0.25
+# Retreating this far (%) from a level re-arms its approach alert, so a
+# second run at the level later in the day pings again.
+APPROACH_REARM_PCT = 0.50
+
+
 def setup_from_dict(d: dict) -> ScalpSetup:
     """Rebuild a ScalpSetup from its journaled to_dict() form."""
     return ScalpSetup(
@@ -755,12 +763,17 @@ def setup_from_dict(d: dict) -> ScalpSetup:
     )
 
 
-def check_level_hits(snapshot: dict, price: float) -> list[dict]:
+def check_level_hits(snapshot: dict, price: float,
+                     last_price: float | None = None) -> list[dict]:
     """Compare a live price against a journaled snapshot's main levels.
 
+    An *approach* fires while price is still `APPROACH_PCT` out and not
+    moving away — the heads-up to stage the order before the level trades.
     A *touch* fires when price enters the level's entry zone (the
     actionable moment); a *break* when it trades beyond the setup's stop
     (the plan is invalidated — the other side of the trade is in play).
+    `last_price` (previous poll) gates approaches by direction; without it
+    the first sighting inside the band still alerts.
     Near levels are deliberately not watched: VWAP gets touched constantly.
     """
     setups = {s["side"]: s for s in snapshot.get("setups", [])}
@@ -779,6 +792,11 @@ def check_level_hits(snapshot: dict, price: float) -> list[dict]:
         elif price <= zone_hi:
             hits.append({"side": "floor", "kind": "touch",
                          "level": floor, "setup": long_setup})
+        elif (price <= floor * (1 + APPROACH_PCT / 100)
+              and (last_price is None or price <= last_price)):
+            hits.append({"side": "floor", "kind": "approach",
+                         "level": floor, "setup": long_setup,
+                         "distance_pct": (price - floor) / floor * 100})
 
     ceiling = snapshot.get("ceiling")
     if ceiling is not None:
@@ -793,7 +811,45 @@ def check_level_hits(snapshot: dict, price: float) -> list[dict]:
         elif price >= zone_lo:
             hits.append({"side": "ceiling", "kind": "touch",
                          "level": ceiling, "setup": short_setup})
+        elif (price >= ceiling * (1 - APPROACH_PCT / 100)
+              and (last_price is None or price >= last_price)):
+            hits.append({"side": "ceiling", "kind": "approach",
+                         "level": ceiling, "setup": short_setup,
+                         "distance_pct": (ceiling - price) / ceiling * 100})
     return hits
+
+
+def approach_eta(price: float, last_price: float, level: float,
+                 minutes: float) -> float | None:
+    """Minutes until price reaches `level` at the pace of the last poll
+    interval. None when price isn't closing in or the interval is empty —
+    a pace measured over one minute is rough, so callers should present
+    this as an estimate, not a promise."""
+    if minutes <= 0:
+        return None
+    closed = abs(last_price - level) - abs(price - level)
+    if closed <= 0:
+        return None
+    return abs(price - level) / (closed / minutes)
+
+
+def rearm_approaches(state: dict, price: float) -> dict:
+    """Drop approach dedup keys for levels that price has since retreated
+    more than `APPROACH_REARM_PCT` away from, so the next run at that level
+    alerts again. Touch/break keys stay one-per-day."""
+    kept = []
+    for key in state.get("alerted", []):
+        parts = key.split(":")
+        if len(parts) == 3 and parts[1] == "approach":
+            try:
+                level = float(parts[2])
+            except ValueError:
+                kept.append(key)
+                continue
+            if abs(price - level) / level * 100 > APPROACH_REARM_PCT:
+                continue  # re-armed
+        kept.append(key)
+    return {**state, "alerted": kept}
 
 
 def filter_new_hits(
@@ -815,13 +871,25 @@ def filter_new_hits(
 
 
 def format_alert(ticker: str, price: float, hit: dict, asof: str = "") -> str:
-    """Telegram text for one level touch/break."""
+    """Telegram text for one level approach/touch/break."""
     side, kind, level = hit["side"], hit["kind"], hit["level"]
     if kind == "break":
         beyond = "below" if side == "floor" else "above"
         lines = [f"🚨 {ticker} {price:.2f} — {side.upper()} {level:.2f} BROKEN",
                  f"Price is {beyond} the stop: the {side}-fade plan is "
                  "invalidated, momentum is in control."]
+    elif kind == "approach":
+        toward = ("dropping toward the FLOOR" if side == "floor"
+                  else "climbing toward the CEILING")
+        lines = [f"⏳ {ticker} {price:.2f} — {toward} {level:.2f} "
+                 f"({hit['distance_pct']:.2f}% away)"]
+        eta = hit.get("eta_min")
+        if eta is not None and eta <= 45:
+            lines.append(f"At the current pace it gets there in ~{eta:.0f} min.")
+        setup = hit.get("setup")
+        if setup:
+            lines.append("Time to stage the order:")
+            lines.append(format_setup(setup_from_dict(setup)))
     else:
         lines = [f"🔔 {ticker} {price:.2f} — at the {side.upper()} {level:.2f}"]
         setup = hit.get("setup")
