@@ -1353,139 +1353,98 @@ def display_fly(rec) -> None:
     console.print()
 
 
-# ── Scalp Levels ─────────────────────────────────────────────────────────────
+# ── Swing Signal ─────────────────────────────────────────────────────────────
 
-def display_scalp(lv) -> None:
-    """Render intraday scalp floor/ceiling with contributing sources."""
-    console.print(Rule(f"[bold cyan]⚡ {lv.ticker} Scalp Levels — "
-                       f"{lv.asof.strftime('%H:%M')} ET"))
+def display_swing(sig) -> None:
+    """Render one end-of-day swing evaluation."""
+    console.print(Rule(f"[bold cyan]🎯 {sig.ticker} Swing — "
+                       f"{sig.as_of.isoformat()} close"))
     body = Table(box=box.SIMPLE, show_header=False, pad_edge=False)
     body.add_column(justify="right", style="bold")
     body.add_column()
-    spot_line = f"{lv.spot:.2f}"
-    if lv.vwap is not None:
-        rel = "above" if lv.spot >= lv.vwap else "below"
-        spot_line += f"   (VWAP {lv.vwap:.2f}, spot {rel})"
-    body.add_row("Spot", spot_line)
-    if lv.rvol is not None:
-        from .scalp import RVOL_QUIET, RVOL_TREND
-        style = ("bold yellow" if lv.rvol >= RVOL_TREND
-                 else "dim" if lv.rvol <= RVOL_QUIET else "")
-        body.add_row("RVOL", Text(
-            f"{lv.rvol:.1f}× ", style=style)
-            + Text(f"(vs {lv.rvol_sessions} prior session"
-                   f"{'s' if lv.rvol_sessions != 1 else ''}, same elapsed time)",
-                   style="dim"))
-    if lv.ceiling is not None:
-        body.add_row(Text("Ceiling", style="bold red"),
-                     Text(f"{lv.ceiling:.2f}  ", style="bold red")
-                     + Text(", ".join(lv.ceiling_sources[:4]), style="dim"))
-    if lv.near_ceiling is not None:
-        body.add_row(Text("↳ near", style="red"),
-                     Text(f"{lv.near_ceiling:.2f}  ", style="red")
-                     + Text(", ".join(lv.near_ceiling_sources[:2])
-                            + f" — break = room to {lv.ceiling:.2f}", style="dim"))
-    if lv.floor is not None:
-        body.add_row(Text("Floor", style="bold green"),
-                     Text(f"{lv.floor:.2f}  ", style="bold green")
-                     + Text(", ".join(lv.floor_sources[:4]), style="dim"))
-    if lv.near_floor is not None:
-        body.add_row(Text("↳ near", style="green"),
-                     Text(f"{lv.near_floor:.2f}  ", style="green")
-                     + Text(", ".join(lv.near_floor_sources[:2])
-                            + f" — break = room to {lv.floor:.2f}", style="dim"))
-    if lv.magnet is not None:
-        body.add_row("Magnet", f"{lv.magnet:g}   [dim]{lv.magnet_detail}[/dim]")
-    if lv.sigma_remaining:
-        body.add_row("1σ left", f"±{lv.sigma_remaining:.2f} "
-                     f"[dim]({lv.minutes_left}m to close, "
-                     f"IV {lv.atm_iv * 100:.0f}%)[/dim]" if lv.atm_iv else
-                     f"±{lv.sigma_remaining:.2f}")
+    ctx = f"{sig.close:.2f}   [dim]trend {sig.trend}"
+    if sig.rsi is not None:
+        ctx += f", RSI {sig.rsi:.0f}"
+    if sig.rvol is not None:
+        ctx += f", RVOL {sig.rvol:.1f}×"
+    if sig.obv_rising is not None:
+        ctx += f", OBV {'rising' if sig.obv_rising else 'falling'}"
+    body.add_row("Close", ctx + "[/dim]")
+
+    if sig.direction == "none":
+        body.add_row("Signal", Text("stand aside — no setup", style="dim"))
+    elif sig.stand_aside:
+        body.add_row("Signal", Text(f"✋ {sig.setup} fired but: "
+                                    f"{sig.stand_aside_reason}", style="yellow"))
+    else:
+        color = "green" if sig.direction == "long" else "red"
+        word = "BUY CALLS" if sig.direction == "long" else "BUY PUTS"
+        body.add_row("Signal", Text(f"{word} — {sig.setup}", style=f"bold {color}"))
+        body.add_row("Entry", f"next open [dim](~{sig.close:.2f} ref)[/dim]")
+        body.add_row("Stop", f"{sig.stop:.2f} [dim](-{sig.stop_pct:.1f}%)[/dim]")
+        body.add_row("Target", f"{sig.target:.2f} [dim]"
+                     f"({'+' if sig.direction == 'long' else '-'}{sig.target_pct:.1f}%, "
+                     f"R:R {sig.rr:.1f}, max hold {sig.max_hold_days} sessions)[/dim]")
+        if sig.option:
+            o = sig.option
+            right = "C" if o["right"] == "call" else "P"
+            body.add_row("Option", f"{o['expiry']} {o['strike']:g}{right} "
+                         f"@ ~{o['mid']:.2f} mid [dim](Δ{o['delta']:+.2f}, "
+                         f"{o['dte']} DTE, breakeven {o['breakeven']:.2f})[/dim]")
     console.print(Panel(body, border_style="cyan"))
 
-    if lv.setups:
-        plan = Table(box=box.SIMPLE, show_header=True, pad_edge=False)
-        plan.add_column("Setup", style="bold")
-        plan.add_column("Entry zone")
-        plan.add_column("Stop")
-        plan.add_column("T1")
-        plan.add_column("T2")
-        plan.add_column("")
-        for s in lv.setups:
-            name = Text(("LONG " if s.side == "long" else "SHORT ") + s.trigger_label,
-                        style="green" if s.side == "long" else "red")
-            if s.skip_reason:
-                plan.add_row(name, f"{s.entry_lo:.2f}–{s.entry_hi:.2f}",
-                             "—", "—", "—", Text(f"✋ {s.skip_reason}", style="yellow"))
-                continue
-            tag = "with trend" if s.with_trend else "counter-trend"
-            plan.add_row(
-                name,
-                f"{s.entry_lo:.2f}–{s.entry_hi:.2f}",
-                f"{s.stop:.2f}",
-                f"{s.target1:.2f} [dim]{s.target1_label} ({s.rr1:.1f}R)[/dim]",
-                f"{s.target2:.2f} [dim]{s.target2_label} ({s.rr2:.1f}R)[/dim]",
-                Text(tag, style="dim" if s.with_trend else "yellow"),
-            )
-        console.print(Panel(plan, title="[bold]Entry/exit plan[/bold]",
-                            border_style="cyan"))
-        for s in lv.setups:
-            for n in s.notes:
-                console.print(f"  [yellow]⚠ {s.side}: {n}[/yellow]")
-
-    for w in lv.warnings:
+    for e in sig.evidence:
+        console.print(f"  [dim]• {e}[/dim]")
+    for w in sig.warnings:
         console.print(f"  [yellow]⚠ {w}[/yellow]")
-    console.print(Text("  OI as of last close. Analysis only — not financial advice.",
-                       style="dim"))
+    console.print(Text("  Signal on completed daily bars; enter next open. "
+                       "Analysis only — not financial advice.", style="dim"))
     console.print()
 
 
-def display_scalp_score(ticker: str, stats: dict) -> None:
-    """Render the mechanically-replayed scalp setup scorecard."""
-    console.print(Rule(f"[bold cyan]⚡ {ticker} Scalp Forward-Test — "
-                       f"{stats['n_setups']} setups over {stats['days']} day(s)"))
+def display_swing_score(ticker: str, stats: dict) -> None:
+    """Render the swing journal scorecard (next-open fills, unadjusted bars)."""
+    console.print(Rule(f"[bold cyan]🎯 {ticker} Swing Forward-Test — "
+                       f"{stats['n_signals']} signal(s)"))
 
     def fmt(b: dict) -> list[str]:
-        if not b["triggered"]:
-            return [str(b["n"]), "0", "—", "—", "—", "—"]
-        return [str(b["n"]), str(b["triggered"]),
-                f"{b['win_rate']:.0%}", f"{b['stop_rate']:.0%}",
+        if not b["n"]:
+            return ["0", "—", "—", "—", "—"]
+        return [str(b["n"]), f"{b['win_rate']:.0%}", f"{b['stop_rate']:.0%}",
                 f"{b['avg_r']:+.2f}R", f"{b['total_r']:+.2f}R"]
 
     t = Table(box=box.SIMPLE_HEAVY)
     t.add_column("Bucket", style="bold")
-    for col in ("setups", "triggered", "win", "stopped", "avg", "total"):
+    for col in ("signals", "win", "stopped", "avg", "total"):
         t.add_column(col, justify="right")
     t.add_row("all traded", *fmt(stats["overall"]))
     t.add_section()
-    t.add_row("long (floor bounce)", *fmt(stats["by_side"]["long"]))
-    t.add_row("short (ceiling fade)", *fmt(stats["by_side"]["short"]))
-    t.add_section()
-    t.add_row("with trend", *fmt(stats["by_trend"]["with_trend"]))
-    t.add_row("counter-trend", *fmt(stats["by_trend"]["counter_trend"]))
-    t.add_section()
-    for band, label in (("quiet", "RVOL quiet (≤0.7×)"), ("normal", "RVOL normal"),
-                        ("trend", "RVOL trend (≥1.5×)"), ("unknown", "RVOL unknown")):
-        b = stats["by_rvol"][band]
-        if b["n"]:
-            t.add_row(label, *fmt(b))
+    t.add_row("long", *fmt(stats["by_direction"]["long"]))
+    t.add_row("short", *fmt(stats["by_direction"]["short"]))
+    if stats["by_setup"]:
+        t.add_section()
+        for setup, b in stats["by_setup"].items():
+            t.add_row(setup, *fmt(b))
     sa = stats["stand_aside"]
     if sa["n"]:
         t.add_section()
         t.add_row("stand-asides (not traded)", *fmt(sa))
     console.print(t)
 
-    if sa["n"] and sa["triggered"] and sa["avg_r"] is not None:
+    oc = stats["by_outcome"]
+    console.print(f"  [dim]Exits: {oc['target']} target, {oc['stop']} stop, "
+                  f"{oc['time']} time ({stats['overall']['n']} traded).[/dim]")
+    if sa["n"] and sa["avg_r"] is not None:
         verdict = ("saving money" if sa["avg_r"] < 0 else
                    "costing opportunity — consider loosening MIN_RR")
         console.print(f"  [dim]Stand-aside filter would have averaged "
                       f"{sa['avg_r']:+.2f}R → {verdict}.[/dim]")
     if stats["pending"]:
-        console.print(f"  [dim]{stats['pending']} setup(s) pending — "
-                      "session incomplete or bars unavailable.[/dim]")
-    console.print(Text("  Mechanical replay: limit entry at trigger, stop/T1 "
-                       "first-touch, stop wins same-bar ties, open trades "
-                       "marked to close. Fills are optimistic (no slippage).",
+        console.print(f"  [dim]{stats['pending']} signal(s) pending — "
+                      "trade window not complete yet.[/dim]")
+    console.print(Text("  Mechanical replay: fill at next open on unadjusted "
+                       "bars, stop wins same-day ties, gaps exit at the open, "
+                       "time exit after the max hold. No slippage/commissions.",
                        style="dim"))
     console.print()
 

@@ -158,78 +158,48 @@ qpat journal              # score everything that has expired
 qpat journal -t SPY --json | jq .summary
 ```
 
-### `qpat scalp [TICKER]`
-**Intraday scalp floor & ceiling** (default SPY). Three families of evidence,
-clustered into one actionable level per side: nearest-expiry **OI walls**
-(biggest put-OI strike below spot / call-OI strike above, plus the
-gamma-weighted "magnet"), the **ATM-IV expected move over the remaining
-session** (shrinks into the close), and **price structure** (VWAP, opening
-range, session and prior-day high/low/close, plus today's **volume profile**
-— point of control and high-volume nodes, so levels with real acceptance
-outrank prices gapped through). Candidates within 0.15% merge;
-a cluster containing an OI wall snaps to the wall's strike. A **relative
-volume** readout (today vs ~5 prior sessions over the same elapsed time)
-tags the tape regime: ≥1.5× flags trend-day risk (fading extremes is
-unreliable and counter-trend setups say so), ≤0.7× flags a quiet
-range-bound tape. When weaker
-structure sits *between* spot and the winning level (e.g. spot pressing the
-session high while the call wall is $4 above), it shows as a **near
-floor/ceiling** line — the trigger price must break before the main level
-is in play.
+### `qpat swing [TICKER]`
+**End-of-day swing signal** (default SPY) for 2-10 day option swings. One
+evaluation per completed daily bar, from three families of evidence:
+**trend** (20/50 EMA stack plus 50-EMA slope — setups only fire with the
+trend), **price structure** (pullback-to-trend reversals: the pullback
+tagged the 20 EMA or dipped RSI, then a reversal bar closed beyond the
+prior bar's extreme; and S/R breakouts through multi-touch levels), and
+**volumetrics** (signal-bar RVOL vs its 20-day baseline, 10-day OBV slope
+— breakouts *require* ≥1.3× expansion volume, pullbacks need RVOL or OBV
+confirming, both always reported).
 
-Each snapshot also carries an **entry/exit plan** per side: long buys the
-floor, short fades the ceiling (mean-reversion between the extremes — the
-only trade the levels support). Entry is a ±0.05% zone around the level,
-stop 0.10% beyond it, T1 at VWAP/magnet when one sits ≥1R inside the range
-(else mid-range), T2 just inside the opposite level, with R-multiples for
-both. A plan whose reward:risk to T2 is under 1.5 says *stand aside*
-instead; counter-trend sides (against spot-vs-VWAP) and targets beyond the
-remaining-session 1σ are flagged. Every snapshot appends to
-`~/.qpat/scalp_journal.jsonl`. Designed to run every 30 minutes during the
-session via launchd with `--notify --cron`:
+A directional signal says **BUY CALLS / BUY PUTS** with: entry next open,
+stop 1.5× ATR beyond entry, target 3× ATR (2R) — capped just inside the
+nearest opposing S/R level, and if that cap drops reward:risk under 1.5
+the signal becomes an explicit stand-aside — plus a max hold of 10
+sessions and a sized **option ticket** (expiry ~30 DTE from the live
+chain, strike nearest 0.60 delta, mid/breakeven, and the estimated $ loss
+per contract if the stop is hit). Scheduled macro prints (FOMC, CPI…)
+inside the hold window are warned about. Every evaluation appends to
+`~/.qpat/swing_journal.jsonl` (one per ticker per day — duplicate runs
+dedup). Designed to run nightly after the close via launchd with
+`--notify --cron`.
 
-| Flag | Description |
-|------|-------------|
-On days with a scheduled macro print (CPI, FOMC, NFP…) the message leads
-with a warning — "stand aside into the print" — because scheduled events
-steamroll mean-reversion levels; it keeps warning for an hour after the
-print, then goes quiet.
+**Forward-test honesty:** the journal stores stop/target as *percentages*
+of the signal close, and `--score` replays each signal from the realized
+**next-session open on unadjusted bars** — so the scorecard measures a
+fill you could actually place, and later dividend adjustments can't
+silently rewrite history (both of which quietly corrupt naive backtests).
 
 | Flag | Description |
 |------|-------------|
-| `--notify` | Send the levels to Telegram (`qpat config set telegram-bot-token` / `telegram-chat-id`) |
-| `--cron` | Scheduler mode: exit silently when the US market is closed |
+| `--notify` | Send the signal to Telegram (`qpat config set telegram-bot-token` / `telegram-chat-id`) |
+| `--cron` | Scheduler mode: exit silently before the US close or on non-trading days |
 | `--json` | Machine-readable output |
-| `--no-log` | Skip the jsonl snapshot log |
-| `--score` | Forward-test scorecard: mechanically replay every journaled setup (limit entry at the trigger, stop/T1 first-touch, stop wins same-bar ties, EOD mark-to-close) and report win/stop rates and R by side, trend alignment, and RVOL band — plus whether the stand-aside filter is saving money |
+| `--no-log` | Skip the jsonl journal append |
+| `--score` | Forward-test scorecard: replay every journaled signal (next-open fill, stop wins same-day ties, gaps exit at the open, time exit after the max hold) and report win/stop rates and R overall, by direction, by setup — plus whether the stand-aside filter is saving money |
 
 ```bash
-qpat scalp                    # SPY levels right now
-qpat scalp QQQ --json
-qpat scalp SPY --notify --cron   # what the 30-min launchd job runs
-```
-
-### `qpat scalp-watch [TICKER]`
-**Level alerts between the 30-minute updates.** Reads the latest
-journaled `scalp` snapshot and compares it to the live price — no chain
-fetch, so it's cheap enough to run every 60 seconds via launchd. Sends a
-Telegram **approach** heads-up while price is still on its way to a level
-(within 0.25% and not moving away, with an ETA from the last poll's pace
-and the full plan, so the order can be staged before the level trades), a
-**touch** alert when price enters the entry zone, and a **break** alert
-when price trades beyond the setup's stop (the fade plan is invalidated).
-Touch/break alert once per level per day; an approach re-arms after price
-retreats 0.5% from the level, so a later second run at it pings again.
-When a 30-minute update moves a level, all its alerts re-arm.
-
-| Flag | Description |
-|------|-------------|
-| `--cron` | Scheduler mode: exit silently when the US market is closed |
-| `--no-notify` | Print alerts without sending to Telegram |
-
-```bash
-qpat scalp-watch                 # check SPY now, alert if at a level
-qpat scalp-watch SPY --cron      # what the 60s launchd job runs
+qpat swing                    # evaluate SPY's last completed bar
+qpat swing SPY --json
+qpat swing SPY --notify --cron   # what the nightly launchd job runs
+qpat swing --score               # how have the signals actually done?
 ```
 
 ### `qpat sr TICKER`

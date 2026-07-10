@@ -2179,260 +2179,150 @@ def fly(ticker, width, select_mode, target_pop, min_rr, band, min_dte, max_dte,
             console.print(f"  [dim]{msg}[/dim]\n")
 
 
-# ── SCALP command ───────────────────────────────────────────────────────────────
+# ── SWING command ───────────────────────────────────────────────────────────────
 
-SCALP_LOG_PATH = Path.home() / ".qpat" / "scalp_journal.jsonl"
+SWING_LOG_PATH = Path.home() / ".qpat" / "swing_journal.jsonl"
 
 
 @cli.command()
 @click.argument("ticker", default="SPY")
-@click.option("--json", "as_json", is_flag=True, help="Emit levels as JSON")
+@click.option("--json", "as_json", is_flag=True, help="Emit the signal as JSON")
 @click.option("--notify", "do_notify", is_flag=True,
-              help="Send levels to Telegram (qpat config set telegram-bot-token / telegram-chat-id)")
+              help="Send the signal to Telegram (qpat config set telegram-bot-token / telegram-chat-id)")
 @click.option("--cron", is_flag=True,
-              help="Scheduler mode: exit silently when the US market is closed")
+              help="Scheduler mode: exit silently before the US close or on non-trading days")
 @click.option("--log/--no-log", "do_log", default=True,
-              help="Append each snapshot to ~/.qpat/scalp_journal.jsonl")
+              help="Append the signal to ~/.qpat/swing_journal.jsonl (one per ticker per day)")
 @click.option("--score", "do_score", is_flag=True,
-              help="Score the journaled snapshots: mechanically replay every "
-                   "setup against what price did next")
-def scalp(ticker, as_json, do_notify, cron, do_log, do_score):
-    """Intraday scalp floor & ceiling for TICKER (default SPY).
+              help="Score the journal: replay every signal from the next session's open")
+def swing(ticker, as_json, do_notify, cron, do_log, do_score):
+    """End-of-day swing signal for TICKER (default SPY): 2-10 day option swings.
 
-    Levels combine nearest-expiry OI walls, the ATM-IV expected move over
-    the REMAINING session, and intraday price structure (VWAP, opening
-    range, session and prior-day levels). Meant to run every 30 minutes
-    during the session via launchd with --notify --cron.
+    Evaluates the completed daily bar — trend (20/50 EMA), pullback
+    reversals and S/R breakouts, confirmed by volumetrics (RVOL, OBV) —
+    and emits BUY CALLS / BUY PUTS / stand-aside with an ATR-based stop,
+    target, and a sized option contract (~30 DTE, ~0.60 delta). Meant to
+    run nightly after the close via launchd with --notify --cron.
     """
-    from .butterfly import atm_iv
-    from .data import YFinanceProvider
-    from .options_data import fetch_chains, get_options_provider
-    from .scalp import ET, compute_scalp_levels, format_message, is_market_open
+    from .swing import (DTE_MAX, DTE_MIN, ET, MAX_HOLD_DAYS, SESSION_CLOSE_ET,
+                        evaluate_swing, format_swing_message, log_swing,
+                        pick_option)
 
     ticker = ticker.upper()
     now_et = datetime.now(ET)
     if do_score:
-        _scalp_score(ticker, now_et, as_json)
+        _swing_score(ticker, now_et, as_json)
         return
-    if cron and not is_market_open(now_et):
+    if cron and (now_et.weekday() >= 5 or now_et.time() < SESSION_CLOSE_ET):
         return
 
     warnings: list[str] = []
-    # Scheduled prints steamroll mean-reversion levels — warn first.
+    dp = get_provider("yfinance")
     try:
-        from .events import EventCatalog
-        from .scalp import event_warnings
-        todays = EventCatalog().search(ticker=ticker, start=now_et.date(),
-                                       end=now_et.date())
-        warnings.extend(event_warnings(
-            [(ev.name, ev.category.value) for ev in todays], now_et))
-    except Exception:
-        pass  # a broken calendar must never block the levels
-    try:
-        # ~5 prior sessions: structure levels use just the last one, the
-        # RVOL baseline averages them all.
-        bars = YFinanceProvider().get_intraday_ohlcv(ticker, days=6)
+        df = dp.get_daily_ohlcv(ticker, now_et.date() - timedelta(days=400),
+                                now_et.date())
     except Exception as e:
         if cron:
-            click.echo(f"scalp: intraday fetch failed: {e}", err=True)
+            click.echo(f"swing: daily fetch failed: {e}", err=True)
             sys.exit(1)
-        console.print(f"[red]Intraday data error: {e}[/red]")
+        console.print(f"[red]Daily data error: {e}[/red]")
         sys.exit(1)
 
-    sessions = sorted(set(bars.index.date))
-    last_session = sessions[-1]
-    today_bars = bars[bars.index.date == last_session]
-    prior_sessions = [bars[bars.index.date == s] for s in sessions[:-1]]
-    prior_bars = prior_sessions[-1] if prior_sessions else None
-    if last_session != now_et.date():
-        if cron:
-            return  # holiday — no session today, stay silent
-        warnings.append(f"market closed — levels from last session ({last_session})")
-    spot = float(today_bars["Close"].iloc[-1])
+    # Mid-session, yfinance already returns today's partial bar — evaluate
+    # only completed bars so the signal can't change before the close.
+    if now_et.weekday() < 5 and now_et.time() < SESSION_CLOSE_ET \
+            and df.index[-1].date() == now_et.date():
+        df = df.iloc[:-1]
+        warnings.append("session in progress — evaluating yesterday's completed bar")
+    last_bar = df.index[-1].date()
+    if cron and last_bar != now_et.date():
+        return  # holiday / wake-coalesced run: no fresh bar, dedup covers the rest
 
-    chain = None
-    chain_expiry = None
-    iv = None
+    sr_levels = find_support_resistance(df.iloc[-130:], window=5, num_levels=5)
+
+    # Scheduled macro prints inside the hold window are exit-risk — warn.
     try:
-        _, candidates, source_warnings = fetch_chains(
-            get_options_provider("auto"), ticker,
-            now_et.date(), now_et.date() + timedelta(days=4))
-        if candidates:
-            expiry, chain = candidates[0]  # nearest expiry = today's 0DTE when listed
-            chain_expiry = expiry.isoformat()
-            iv = atm_iv(chain, spot)
-        warnings.extend(source_warnings)
-    except Exception as e:
-        # Unlike `fly`, the chain is one of several level sources here —
-        # degrade to price action + IV-less levels, but say so prominently.
-        warnings.append(f"OI walls unavailable ({e}) — levels from price action + prior session only")
+        from .events import EventCatalog
+        upcoming = EventCatalog().search(
+            ticker=ticker, start=last_bar + timedelta(days=1),
+            end=last_bar + timedelta(days=MAX_HOLD_DAYS * 2))
+        for ev in upcoming:
+            warnings.append(f"{ev.name} ({ev.date}) lands inside the hold window")
+    except Exception:
+        pass  # a broken calendar must never block the signal
 
-    levels = compute_scalp_levels(
-        ticker, spot, now_et, today_bars, prior_bars, chain, iv,
-        chain_expiry=chain_expiry, warnings=warnings,
-        prior_sessions=prior_sessions,
-    )
+    sig = evaluate_swing(ticker, df, sr_levels=sr_levels, warnings=warnings)
+
+    if sig.direction in ("long", "short") and not sig.stand_aside:
+        try:
+            from .options_data import fetch_chains, get_options_provider
+            _, chains, src_warns = fetch_chains(
+                get_options_provider("auto"), ticker,
+                sig.as_of + timedelta(days=DTE_MIN),
+                sig.as_of + timedelta(days=DTE_MAX))
+            sig.option = pick_option(chains, sig.close, sig.direction, sig.as_of)
+            sig.warnings.extend(src_warns)
+            if sig.option is None:
+                sig.warnings.append("no suitable contract in the 21-50 DTE "
+                                    "window — pick ~30 DTE Δ0.60 manually")
+        except Exception as e:
+            sig.warnings.append(f"option ticket unavailable ({e}) — "
+                                "signal stands on the shares")
 
     if do_log:
-        SCALP_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with SCALP_LOG_PATH.open("a") as f:
-            f.write(json.dumps(levels.to_dict()) + "\n")
+        log_swing(sig, SWING_LOG_PATH)
 
     if as_json:
-        click.echo(json.dumps(levels.to_dict(), indent=2))
+        click.echo(json.dumps(sig.to_dict(), indent=2))
     elif not cron:
-        from .display import display_scalp
-        display_scalp(levels)
+        from .display import display_swing
+        display_swing(sig)
 
     if do_notify:
         from .notify import TelegramError, send_telegram
         try:
-            send_telegram(format_message(levels))
+            send_telegram(format_swing_message(sig))
         except TelegramError as e:
             if cron:
-                click.echo(f"scalp: {e}", err=True)
+                click.echo(f"swing: {e}", err=True)
             else:
                 console.print(f"[red]{e}[/red]")
             sys.exit(1)
 
 
-def _scalp_score(ticker: str, now_et, as_json: bool) -> None:
-    """Replay every journaled scalp setup against actual price history."""
+def _swing_score(ticker: str, now_et, as_json: bool) -> None:
+    """Replay every journaled swing signal from the next session's open."""
     from .data import YFinanceProvider
-    from .scalp import SESSION_CLOSE, score_scalp_journal
+    from .swing import SESSION_CLOSE_ET, load_swing_journal, score_swing_journal
 
-    entries = []
-    if SCALP_LOG_PATH.exists():
-        for line in SCALP_LOG_PATH.read_text().splitlines():
-            try:
-                d = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if d.get("ticker") == ticker and d.get("setups"):
-                entries.append(d)
-    if not entries:
-        console.print(f"[yellow]No journaled {ticker} scalp setups yet — "
-                      "the 30-min cron fills ~/.qpat/scalp_journal.jsonl.[/yellow]")
+    entries = [e for e in load_swing_journal(SWING_LOG_PATH)
+               if e.get("ticker") == ticker]
+    directional = [e for e in entries if e.get("direction") in ("long", "short")]
+    if not directional:
+        console.print(f"[yellow]No directional {ticker} swing signals journaled "
+                      "yet — the nightly cron fills ~/.qpat/swing_journal.jsonl.[/yellow]")
         return
 
-    first_day = date.fromisoformat(entries[0]["asof"][:10])
-    span = min(59, (now_et.date() - first_day).days + 2)  # 5m bars: 60d limit
-    bars = YFinanceProvider().get_intraday_ohlcv(ticker, days=span)
-    by_day = {d.isoformat(): bars[bars.index.date == d]
-              for d in set(bars.index.date)}
-    # Today's session only scores once it's complete.
-    session_over = now_et.time() >= SESSION_CLOSE
-    today = now_et.date().isoformat()
+    first = min(date.fromisoformat(e["as_of"]) for e in directional)
+    # Unadjusted bars: journaled levels are raw prices — adjusted history
+    # would shift under them at every ex-dividend date.
+    df = YFinanceProvider().get_daily_ohlcv(
+        ticker, first, now_et.date(), auto_adjust=False)
+    # Only completed sessions count; drop today's partial bar mid-session.
+    if now_et.weekday() < 5 and now_et.time() < SESSION_CLOSE_ET \
+            and df.index[-1].date() == now_et.date():
+        df = df.iloc[:-1]
 
-    def get_bars(tkr, day):
-        if day == today and not session_over:
-            return None
-        return by_day.get(day)
+    def get_bars(tkr, as_of_iso):
+        after = df[df.index.date > date.fromisoformat(as_of_iso)]
+        return after if not after.empty else None
 
-    stats = score_scalp_journal(entries, get_bars)
+    stats = score_swing_journal(entries, get_bars)
     if as_json:
         click.echo(json.dumps(stats, indent=2))
     else:
-        from .display import display_scalp_score
-        display_scalp_score(ticker, stats)
-
-
-SCALP_WATCH_STATE = Path.home() / ".qpat" / "scalp_watch_state.json"
-
-
-@cli.command("scalp-watch")
-@click.argument("ticker", default="SPY")
-@click.option("--cron", is_flag=True,
-              help="Scheduler mode: exit silently when the US market is closed")
-@click.option("--notify/--no-notify", "do_notify", default=True,
-              help="Send touch/break alerts to Telegram (default on)")
-def scalp_watch(ticker, cron, do_notify):
-    """Alert when price nears or touches the latest scalp floor or ceiling.
-
-    Reads the most recent `qpat scalp` snapshot from the journal and
-    compares it to the live price — no chain fetch, cheap enough to run
-    every minute via launchd between the 30-minute level updates.
-    An approach heads-up fires while price is still on its way (with an
-    ETA from the last poll's pace) so the order can be staged early; the
-    touch and stop-break alerts confirm. Touch/break alert once per level
-    per day; an approach re-arms after price retreats from the level.
-    """
-    from .data import YFinanceProvider
-    from .scalp import (ET, approach_eta, check_level_hits, filter_new_hits,
-                        format_alert, is_market_open, rearm_approaches)
-
-    ticker = ticker.upper()
-    now_et = datetime.now(ET)
-    if cron and not is_market_open(now_et):
-        return
-
-    snapshot = None
-    if SCALP_LOG_PATH.exists():
-        for line in reversed(SCALP_LOG_PATH.read_text().splitlines()):
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if entry.get("ticker") == ticker:
-                snapshot = entry
-                break
-    today = now_et.date().isoformat()
-    if snapshot is None or snapshot["asof"][:10] != today:
-        # No levels logged yet today (cron hasn't fired / holiday).
-        if not cron:
-            console.print("[yellow]No scalp snapshot for "
-                          f"{ticker} today — run `qpat scalp {ticker}` first.[/yellow]")
-        return
-
-    try:
-        price = YFinanceProvider().get_last_price(ticker)
-    except Exception as e:
-        click.echo(f"scalp-watch: price fetch failed: {e}", err=True)
-        sys.exit(1)
-
-    state = {}
-    if SCALP_WATCH_STATE.exists():
-        try:
-            state = json.loads(SCALP_WATCH_STATE.read_text())
-        except json.JSONDecodeError:
-            state = {}
-    # Last poll's price feeds approach direction + pace; only trust it
-    # within the same session.
-    last = state.get("last") if state.get("date") == today else None
-    now_ts = now_et.timestamp()
-    hits = check_level_hits(snapshot, price,
-                            last_price=last["price"] if last else None)
-    if last:
-        minutes = (now_ts - last["ts"]) / 60
-        for h in hits:
-            if h["kind"] == "approach":
-                h["eta_min"] = approach_eta(price, last["price"],
-                                            h["level"], minutes)
-    state = rearm_approaches(state, price)
-    new_hits, state = filter_new_hits(hits, state, today)
-    state["last"] = {"ts": now_ts, "price": price}
-    SCALP_WATCH_STATE.parent.mkdir(parents=True, exist_ok=True)
-    SCALP_WATCH_STATE.write_text(json.dumps(state))
-
-    asof_hhmm = snapshot["asof"][11:16]
-    if not cron:
-        floor, ceiling = snapshot.get("floor"), snapshot.get("ceiling")
-        console.print(f"{ticker} {price:.2f} — floor {floor}, ceiling {ceiling} "
-                      f"(levels {asof_hhmm} ET); "
-                      + (f"{len(new_hits)} new alert(s)" if new_hits else "no touch"))
-    if not new_hits:
-        return
-    for hit in new_hits:
-        text = format_alert(ticker, price, hit, asof=f"{asof_hhmm} ET")
-        if not cron:
-            console.print(text)
-        if do_notify:
-            from .notify import TelegramError, send_telegram
-            try:
-                send_telegram(text)
-            except TelegramError as e:
-                click.echo(f"scalp-watch: {e}", err=True)
-                sys.exit(1)
+        from .display import display_swing_score
+        display_swing_score(ticker, stats)
 
 
 # ── JOURNAL command ─────────────────────────────────────────────────────────────

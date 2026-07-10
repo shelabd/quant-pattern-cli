@@ -45,15 +45,18 @@ class YFinanceProvider(DataProvider):
     """
 
     def __init__(self):
-        self._cache: dict[tuple[str, date, date], pd.DataFrame] = {}
+        self._cache: dict[tuple[str, date, date, bool], pd.DataFrame] = {}
 
     def name(self) -> str:
         return "Yahoo Finance"
 
     def get_daily_ohlcv(
-        self, ticker: str, start: date, end: date
+        self, ticker: str, start: date, end: date, auto_adjust: bool = True
     ) -> pd.DataFrame:
-        cache_key = (ticker, start, end)
+        """auto_adjust=False returns raw traded prices — required when
+        scoring journaled levels: adjusted history shifts under raw journal
+        prices at every ex-dividend date."""
+        cache_key = (ticker, start, end, auto_adjust)
         cached = self._cache.get(cache_key)
         if cached is not None:
             return cached.copy()
@@ -63,7 +66,7 @@ class YFinanceProvider(DataProvider):
         logger.info(f"Fetching {ticker} from yfinance: {start} → {end}")
 
         tk = yf.Ticker(ticker)
-        df = tk.history(start=start.isoformat(), end=end_adj.isoformat(), auto_adjust=True)
+        df = tk.history(start=start.isoformat(), end=end_adj.isoformat(), auto_adjust=auto_adjust)
 
         if df.empty:
             raise ValueError(f"No data returned for {ticker} between {start} and {end}")
@@ -74,42 +77,6 @@ class YFinanceProvider(DataProvider):
         df.index.name = "Date"
         self._cache[cache_key] = df
         return df.copy()
-
-    def get_intraday_ohlcv(self, ticker: str, interval: str = "5m",
-                           days: int = 2) -> pd.DataFrame:
-        """Recent intraday bars (regular session only), tz-aware ET index.
-
-        Used by `qpat scalp` — today's bars for VWAP/opening range plus the
-        prior session for its high/low/close. Not cached: intraday data goes
-        stale within minutes.
-        """
-        tk = yf.Ticker(ticker)
-        df = tk.history(period=f"{days}d", interval=interval,
-                        auto_adjust=True, prepost=False)
-        if df.empty:
-            raise ValueError(f"No intraday data returned for {ticker}")
-        df.index = pd.to_datetime(df.index).tz_convert("America/New_York")
-        return df[["Open", "High", "Low", "Close", "Volume"]].copy()
-
-    def get_last_price(self, ticker: str) -> float:
-        """Latest traded price, as cheap as yfinance allows.
-
-        Used by `qpat scalp-watch`, which runs every couple of minutes —
-        fast_info is a single quote lookup; the 1-minute-bar fallback covers
-        tickers where fast_info comes back empty.
-        """
-        tk = yf.Ticker(ticker)
-        try:
-            price = tk.fast_info["last_price"]
-            if price and price > 0:
-                return float(price)
-        except (KeyError, TypeError, ValueError):
-            pass
-        df = tk.history(period="1d", interval="1m", auto_adjust=True,
-                        prepost=False)
-        if df.empty:
-            raise ValueError(f"No price data returned for {ticker}")
-        return float(df["Close"].iloc[-1])
 
 
 class IBKRProvider(DataProvider):
