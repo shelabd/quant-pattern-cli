@@ -147,13 +147,23 @@ realized expiry-day close. You get **pin accuracy** (median settle
 distance from the recommended pin, % within 0.5%) for all entries
 including NO TRADEs, and **trade stats** (in-tent hit rate, win rate,
 total P&L per fly at the mid debit, avg R multiple) for priced PASS
-entries. Settlement uses the expiry-day close — exact for PM-settled
+entries. Settlement uses the **unadjusted** expiry-day close (journaled
+strikes are raw prices — adjusted history would shift under them at every
+ex-dividend date and silently re-score old entries) — exact for PM-settled
 SPY/QQQ/equities, a proxy for AM-settled index options (SPX/RUT). Log
 daily for a few weeks and you have the track record no free data source
 can reconstruct.
 
+For the journal to measure *placeable* trades, log while the market is
+still open: `--cron` gates the run to Mon-Fri 15:15-16:00 ET (late enough
+that the OI/pin picture is near-final, early enough that the 15-min-delayed
+quotes are live and the ticket can be entered before the close) and exits
+silently otherwise — after-close and wake-coalesced launchd runs would
+journal debits nobody can fill.
+
 ```bash
 qpat fly SPY --log        # log today's recommendation
+qpat fly SPY --log --cron # what the scheduled job runs (silent outside 15:15-16:00 ET)
 qpat journal              # score everything that has expired
 qpat journal -t SPY --json | jq .summary
 ```

@@ -1479,6 +1479,10 @@ def display_journal(scored: list, pending: list, stats: dict) -> None:
         if cal:
             ctext = Text()
             ctext.append(f"Forecast calibration ({cal['n_forecast']} trades)\n", style="bold white")
+            if cal["n_forecast"] < 30:
+                ctext.append(f"⚠ small sample (n={cal['n_forecast']}) — Brier, "
+                             "calibration, and centering are indicative only "
+                             "below ~30 trades\n", style="yellow")
             ctext.append("POP — predicted: ", style="white")
             ctext.append(f"{cal['mean_pred_pop']:.0%}", style="bold cyan")
             ctext.append("  vs actual win rate: ", style="white")

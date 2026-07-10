@@ -567,3 +567,20 @@ class TestSelectWidthByPop:
         assert strict["selected"]["width"] == 5.0      # only 1:9 fly clears 1:5
         assert loose["selected"]["width"] == 20.0      # widest +EV fly clears 1:1
         assert loose["selected"]["pop"] > strict["selected"]["pop"]
+
+
+# ── Fly cron logging window ──────────────────────────────────────────────────
+
+def test_in_fly_log_window():
+    from datetime import datetime
+    from quant_patterns.butterfly import ET, in_fly_log_window
+
+    def at(day, hour, minute):
+        return datetime(2026, 7, day, hour, minute, tzinfo=ET)
+
+    assert in_fly_log_window(at(10, 15, 40))          # Friday 15:40 ET
+    assert in_fly_log_window(at(10, 15, 15))          # window start inclusive
+    assert not in_fly_log_window(at(10, 16, 0))       # close = exclusive
+    assert not in_fly_log_window(at(10, 16, 15))      # the old after-close slot
+    assert not in_fly_log_window(at(10, 2, 30))       # wake-coalesced 2am run
+    assert not in_fly_log_window(at(11, 15, 40))      # Saturday

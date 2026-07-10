@@ -12,7 +12,11 @@ recommended pin, and the P&L of the recommended structure.
 Pure logic except the jsonl read/append helpers; settle prices are
 injected as a callable so scoring is offline-testable. Settlement uses the
 expiry-day close — a proxy that is exact for PM-settled contracts
-(SPY/QQQ/equities) but not for AM-settled index options (SPX/RUT).
+(SPY/QQQ/equities) but not for AM-settled index options (SPX/RUT). The
+injected close must be UNADJUSTED (journaled strikes are raw prices;
+adjusted history shifts under them at every ex-dividend date) and entries
+should be journaled from live-market quotes (`qpat fly --cron` gates the
+scheduled run to 15:15-16:00 ET) so the debit is a placeable fill.
 """
 
 from __future__ import annotations

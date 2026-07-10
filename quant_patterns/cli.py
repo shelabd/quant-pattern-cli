@@ -2089,11 +2089,15 @@ def dashboard(ticker, event_type, days, lookback, top_n, bins, regime, target_da
 @click.option("--log", "log_entry", is_flag=True,
               help="Append the recommendation to the forward-test journal "
                    "(~/.qpat/fly_journal.jsonl); score later with `qpat journal`")
+@click.option("--cron", is_flag=True,
+              help="Scheduler mode: exit silently outside Mon-Fri 15:15-16:00 ET "
+                   "— after-close and wake-coalesced runs would journal quotes "
+                   "nobody can trade")
 @click.option("--json", "as_json", is_flag=True,
               help="Emit the recommendation as JSON (for piping)")
 @common_options
 def fly(ticker, width, select_mode, target_pop, min_rr, band, min_dte, max_dte,
-        account, expiry_str, chain_source, log_entry, as_json, provider, verbose):
+        account, expiry_str, chain_source, log_entry, cron, as_json, provider, verbose):
     """
     Recommend a 3-Day Pin Fly: a 2-5 DTE butterfly bodied on the highest
     open-interest pin strike near spot.
@@ -2119,11 +2123,13 @@ def fly(ticker, width, select_mode, target_pop, min_rr, band, min_dte, max_dte,
 
       qpat fly SPY --json | jq .legs
     """
-    from .butterfly import recommend_fly
+    from .butterfly import ET, in_fly_log_window, recommend_fly
     from .display import display_fly
 
     setup_logging(verbose)
     ticker = ticker.upper()
+    if cron and not in_fly_log_window(datetime.now(ET)):
+        return
     expiry_override = (datetime.strptime(expiry_str, "%Y-%m-%d").date()
                        if expiry_str else None)
 
@@ -2355,9 +2361,13 @@ def journal(ticker, as_json, provider, verbose):
     dp = get_provider("yfinance")
 
     def get_close(tkr: str, day: date) -> Optional[float]:
+        # Unadjusted close: journaled strikes are raw prices, and adjusted
+        # history shifts under them at every ex-dividend date, silently
+        # re-scoring old entries.
         for symbol in (tkr, f"^{tkr}"):
             try:
-                df = dp.get_daily_ohlcv(symbol, day - timedelta(days=7), day)
+                df = dp.get_daily_ohlcv(symbol, day - timedelta(days=7), day,
+                                        auto_adjust=False)
             except ValueError:
                 continue
             if df.index[-1].date() == day:

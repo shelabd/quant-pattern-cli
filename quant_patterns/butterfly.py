@@ -44,14 +44,33 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, time
 from statistics import NormalDist
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+ET = ZoneInfo("America/New_York")
+
+# `qpat fly --cron` journals only inside this ET window: late enough that the
+# session is nearly done (the pin/OI picture is close to final), early enough
+# that the 15-min-delayed quotes are still live-market and the ticket can
+# actually be placed before the close. Runs outside it (after-close slots,
+# wake-coalesced launchd firings at odd hours) exit silently — an after-close
+# debit is a fill nobody can get, and it poisons the forward test.
+FLY_LOG_WINDOW_ET = (time(15, 15), time(16, 0))
+
+
+def in_fly_log_window(now_et: datetime) -> bool:
+    """True on weekdays inside FLY_LOG_WINDOW_ET (see note above)."""
+    if now_et.weekday() >= 5:
+        return False
+    start, end = FLY_LOG_WINDOW_ET
+    return start <= now_et.time() < end
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
