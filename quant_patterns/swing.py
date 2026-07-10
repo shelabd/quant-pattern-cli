@@ -90,6 +90,25 @@ DTE_MAX = 50
 DTE_IDEAL = 30
 TARGET_DELTA = 0.60
 
+# Low-volume pump (added 2026-07-10, from the user's analyst): a grind of
+# consecutive closes above a freshly reclaimed round-number level on thin
+# volume. Price marked up without participation is fragile — the observed
+# ending (e.g. SPY May 26-Jun 2 2026: six closes above 750 on ~0.9x volume,
+# then a one-day 94M-share flush to 737) is a high-volume break back below
+# the level. While the pump runs we WARN (don't chase longs, the analog
+# tops within a handful of sessions); the tradeable signal is the FLUSH:
+# a close back below the pump's level on expansion volume, shorted even
+# against the EMA trend (the unwind is counter-trend by construction).
+PUMP_MIN_DAYS = 2          # closes above the level before it counts
+PUMP_MAX_AGE_BARS = 15     # older than this = just a bull market, not a pump
+# Volume test, either passes: streak mean RVOL <= the ceiling, OR most streak
+# days are quiet (<1x). The OR matters: the May 2026 analog's topping days
+# churned at 1.1x and drag the 8-day mean to 0.94, but 5 of 8 days were quiet.
+PUMP_MAX_MEAN_RVOL = 0.9
+PUMP_QUIET_FRAC = 0.6
+PUMP_LATE_DAYS = 5         # "clock running out" note (analog topped day 6)
+PUMP_FLUSH_RVOL = 1.3      # flush bar must print real volume (analog: 2.0x)
+
 
 # ── Indicators (pandas, Wilder-style smoothing) ──────────────────────────────
 
@@ -141,6 +160,53 @@ def obv_rising(close: pd.Series, volume: pd.Series,
     return bool(series.iloc[-1] > series.iloc[-1 - lookback])
 
 
+def _round_step(price: float) -> float:
+    """Round-number grid one order of magnitude below the price's decade:
+    $10 steps for a ~$750 ticker, $1 steps for a ~$40 one."""
+    return 10.0 ** (math.floor(math.log10(price)) - 1)
+
+
+def detect_pump(df: pd.DataFrame, rvol_window: int = RVOL_WINDOW) -> Optional[dict]:
+    """Detect a low-volume pump as of the last bar of `df`.
+
+    The level is the largest round-step multiple under the last close; the
+    streak is the run of consecutive closes above it (so the count re-anchors
+    if price climbs a full step). A pump needs PUMP_MIN_DAYS..PUMP_MAX_AGE_BARS
+    closes, a net-rising grind, and a streak mean RVOL <= PUMP_MAX_MEAN_RVOL.
+    Returns {level, days, mean_rvol, gain_pct} or None.
+    """
+    if len(df) < rvol_window + PUMP_MIN_DAYS + 1:
+        return None
+    closes = df["Close"].to_numpy(dtype=float)
+    if closes[-1] <= 0:
+        return None
+    vol = df["Volume"]
+    rvol = (vol / vol.rolling(rvol_window).mean().shift(1)).to_numpy()
+
+    step = _round_step(closes[-1])
+    level = math.floor(closes[-1] / step) * step
+    days = 0
+    for i in range(len(closes) - 1, -1, -1):
+        if closes[i] > level and days < PUMP_MAX_AGE_BARS:
+            days += 1
+        else:
+            break
+    if not (PUMP_MIN_DAYS <= days < PUMP_MAX_AGE_BARS):
+        return None
+    streak_rvol = rvol[len(closes) - days:]
+    if np.isnan(streak_rvol).any():
+        return None
+    mean_rvol = float(np.mean(streak_rvol))
+    quiet_frac = float(np.mean(streak_rvol < 1.0))
+    first = closes[len(closes) - days]
+    volume_thin = mean_rvol <= PUMP_MAX_MEAN_RVOL or quiet_frac >= PUMP_QUIET_FRAC
+    if not volume_thin or closes[-1] < first:
+        return None
+    return {"level": float(level), "days": days,
+            "mean_rvol": round(mean_rvol, 2),
+            "gain_pct": round(float(closes[-1] / first - 1) * 100, 2)}
+
+
 def detect_trend(df: pd.DataFrame) -> str:
     """'up' | 'down' | 'sideways' from the EMA stack + slow-EMA slope."""
     if len(df) < TREND_EMA_SLOW + SLOPE_LOOKBACK:
@@ -185,6 +251,7 @@ class SwingSignal:
     evidence: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     option: Optional[dict] = None
+    pump: Optional[dict] = None   # active/broken low-volume pump, if any
 
     def to_dict(self) -> dict:
         def r2(v):
@@ -211,6 +278,7 @@ class SwingSignal:
             "evidence": list(self.evidence),
             "warnings": list(self.warnings),
             "option": self.option,
+            "pump": self.pump,
             "disclaimer": "Analysis only — not financial advice.",
         }
 
@@ -320,49 +388,78 @@ def evaluate_swing(ticker: str, df: pd.DataFrame,
                       close=close, trend=trend, atr=atr_val, rsi=rsi_val,
                       rvol=rvol, obv_rising=rising, warnings=warns)
 
-    direction = {"up": "long", "down": "short"}.get(trend)
-    if direction is None:
-        sig.evidence.append("EMA stack sideways — no trend to swing with")
-        return sig
-
-    # Breakout beats pullback when both fire on the same bar (rarer, cleaner).
+    # ── Low-volume pump: flush short first (trend-exempt), else warn ────
     setup = ""
-    evidence = [f"trend {trend} (close vs 20/50 EMA stack, 50-EMA slope)"]
-    level = _breakout_level(df, sr_levels, direction)
-    if level is not None:
-        vol_ok = rvol is not None and rvol >= BREAKOUT_RVOL
-        if vol_ok:
-            setup = f"breakout {direction}"
-            evidence.append(
-                f"closed through {level.kind} {level.price:.2f} "
-                f"({level.touches} touches) on {rvol:.1f}x volume")
-            if rising is False:
-                sig.warnings.append("OBV not confirming the breakout — "
-                                    "watch for a failed break")
-        else:
-            sig.warnings.append(
-                f"crossed {level.kind} {level.price:.2f} but volume "
-                f"{'unknown' if rvol is None else f'{rvol:.1f}x'} < "
-                f"{BREAKOUT_RVOL:g}x — unconfirmed break, standing aside")
-
-    if not setup and _pullback_ready(df, atr_val, direction) \
-            and _reversal_trigger(df, direction):
-        vol_ok = (rvol is not None and rvol >= CONFIRM_RVOL) or rising is True
-        if vol_ok:
-            setup = f"pullback {direction}"
-            evidence.append(
-                ("pullback to the 20 EMA / RSI dip, then a reversal bar closed "
-                 + ("above the prior high" if direction == "long"
-                    else "below the prior low")))
-        else:
-            sig.warnings.append("pullback reversal fired but neither RVOL nor "
-                                "OBV confirms — standing aside")
+    direction: Optional[str] = None
+    evidence: list[str] = []
+    pump_prior = detect_pump(df.iloc[:-1])
+    pump_now = detect_pump(df)
+    prev_close = float(df["Close"].iloc[-2])
+    if (pump_prior is not None and rvol is not None
+            and rvol >= PUMP_FLUSH_RVOL
+            and close < pump_prior["level"] and close < prev_close):
+        direction, setup = "short", "pump flush short"
+        sig.pump = pump_prior
+        evidence = [
+            f"low-volume pump broke: {pump_prior['days']} consecutive closes "
+            f"above {pump_prior['level']:g} on {pump_prior['mean_rvol']:.1f}x "
+            f"average volume, flushed back below on {rvol:.1f}x — the unwind trade"]
+        if trend != "down":
+            evidence.append("counter-trend by the EMA stack — this is the "
+                            "pump's unwind, not a trend trade")
+    elif pump_now is not None:
+        sig.pump = pump_now
+        note = (f"low-volume pump: {pump_now['days']} consecutive closes above "
+                f"{pump_now['level']:g} on {pump_now['mean_rvol']:.1f}x average "
+                f"volume (+{pump_now['gain_pct']:.1f}%) — thin rally, prone to "
+                "a high-volume flush; don't chase longs")
+        if pump_now["days"] >= PUMP_LATE_DAYS:
+            note += f" (late-stage, day {pump_now['days']})"
+        sig.warnings.append(note)
 
     if not setup:
-        if not sig.warnings:
-            sig.evidence.append(f"trend {trend}, no entry trigger — wait for a "
-                                "pullback reversal or a confirmed breakout")
-        return sig
+        direction = {"up": "long", "down": "short"}.get(trend)
+        if direction is None:
+            sig.evidence.append("EMA stack sideways — no trend to swing with")
+            return sig
+
+        # Breakout beats pullback when both fire on the same bar (rarer, cleaner).
+        evidence = [f"trend {trend} (close vs 20/50 EMA stack, 50-EMA slope)"]
+        level = _breakout_level(df, sr_levels, direction)
+        if level is not None:
+            vol_ok = rvol is not None and rvol >= BREAKOUT_RVOL
+            if vol_ok:
+                setup = f"breakout {direction}"
+                evidence.append(
+                    f"closed through {level.kind} {level.price:.2f} "
+                    f"({level.touches} touches) on {rvol:.1f}x volume")
+                if rising is False:
+                    sig.warnings.append("OBV not confirming the breakout — "
+                                        "watch for a failed break")
+            else:
+                sig.warnings.append(
+                    f"crossed {level.kind} {level.price:.2f} but volume "
+                    f"{'unknown' if rvol is None else f'{rvol:.1f}x'} < "
+                    f"{BREAKOUT_RVOL:g}x — unconfirmed break, standing aside")
+
+        if not setup and _pullback_ready(df, atr_val, direction) \
+                and _reversal_trigger(df, direction):
+            vol_ok = (rvol is not None and rvol >= CONFIRM_RVOL) or rising is True
+            if vol_ok:
+                setup = f"pullback {direction}"
+                evidence.append(
+                    ("pullback to the 20 EMA / RSI dip, then a reversal bar closed "
+                     + ("above the prior high" if direction == "long"
+                        else "below the prior low")))
+            else:
+                sig.warnings.append("pullback reversal fired but neither RVOL nor "
+                                    "OBV confirms — standing aside")
+
+        if not setup:
+            if not sig.warnings:
+                sig.evidence.append(f"trend {trend}, no entry trigger — wait for a "
+                                    "pullback reversal or a confirmed breakout")
+            return sig
 
     # ── Geometry ─────────────────────────────────────────────────────────
     stop_dist = STOP_ATR * atr_val

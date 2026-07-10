@@ -313,3 +313,69 @@ def test_format_message_none():
     sig = SwingSignal(ticker="SPY", as_of=date(2026, 7, 10), direction="none",
                       setup="", close=100.0, trend="sideways")
     assert "stand aside" in format_swing_message(sig).lower()
+
+
+# ── Low-volume pump + flush short ────────────────────────────────────────────
+
+def pump_base(n_base=54, base_step=0.25):
+    """Rising base that stays below 750, ending ~745."""
+    closes = 745 - base_step * np.arange(n_base)[::-1]
+    return list(closes)
+
+
+def pump_frame(streak_vol=0.7e6, flush=False, flush_vol=2.0e6):
+    """~745 grind-up base, then a 6-day low-volume streak above 750
+    (the May 26 - Jun 2 2026 SPY analog), optionally + the Jun 5 flush bar."""
+    closes = pump_base()
+    vols = [1e6] * len(closes)
+    streak = [750.6, 750.5, 754.6, 756.5, 758.5, 759.6]
+    closes += streak
+    vols += [streak_vol] * len(streak)
+    if flush:
+        closes.append(737.5)
+        vols.append(flush_vol)
+    closes = np.asarray(closes)
+    return make_frame(closes, volumes=np.asarray(vols),
+                      lows=closes - 1.0, highs=closes + 1.0,
+                      opens=closes + 0.5 if flush else closes - 0.1)
+
+
+def test_detect_pump_on_may_analog():
+    from quant_patterns.swing import detect_pump
+    pump = detect_pump(pump_frame())
+    assert pump is not None
+    assert pump["level"] == 750.0
+    assert pump["days"] == 6
+    assert pump["mean_rvol"] < 0.9
+    assert pump["gain_pct"] > 0
+
+
+def test_no_pump_on_normal_volume():
+    from quant_patterns.swing import detect_pump
+    assert detect_pump(pump_frame(streak_vol=1.0e6)) is None
+
+
+def test_pump_warns_but_no_flush_setup():
+    sig = evaluate_swing("SPY", pump_frame())
+    assert sig.pump is not None
+    assert sig.setup != "pump flush short"
+    assert any("low-volume pump" in w for w in sig.warnings)
+    assert any("day 6" in w for w in sig.warnings)  # late-stage note
+
+
+def test_flush_short_fires_counter_trend():
+    sig = evaluate_swing("SPY", pump_frame(flush=True))
+    # The flush bar itself breaks the EMA-stack "up" read — which is exactly
+    # why this setup must be exempt from the trend gate.
+    assert sig.trend != "down"
+    assert sig.setup == "pump flush short"
+    assert sig.direction == "short"
+    assert not sig.stand_aside
+    assert sig.stop > sig.close > sig.target
+    assert sig.pump is not None and sig.pump["level"] == 750.0
+    assert any("counter-trend" in e for e in sig.evidence)
+
+
+def test_flush_requires_expansion_volume():
+    sig = evaluate_swing("SPY", pump_frame(flush=True, flush_vol=0.9e6))
+    assert sig.setup != "pump flush short"

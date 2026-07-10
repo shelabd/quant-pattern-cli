@@ -179,6 +179,20 @@ prior bar's extreme; and S/R breakouts through multi-touch levels), and
 — breakouts *require* ≥1.3× expansion volume, pullbacks need RVOL or OBV
 confirming, both always reported).
 
+**Low-volume pump detection.** Consecutive closes above a freshly
+reclaimed round-number level (e.g. $750) on thin volume — price marked up
+without participation — is flagged as a **pump**: the signal warns "don't
+chase longs" while it runs, with a late-stage note from day 5 (the May
+26-Jun 2 2026 SPY analog topped on day 6). The tradeable half is the
+**pump flush short**: a close back below the pump's level on ≥1.3× volume
+fires BUY PUTS *even against the EMA trend* — the unwind is counter-trend
+by construction (June 5 2026: a 94M-share, 2× RVOL flush from ~757 to
+737.55). Replayed on real data the engine warns "late-stage, day 6" on
+June 2 and fires the flush short on the June 5 bar. Because round-number
+levels live on the tape, the whole evaluation runs on **unadjusted**
+prices (the June ex-dividend shifts May's 750-closes below 750 in
+adjusted data).
+
 A directional signal says **BUY CALLS / BUY PUTS** with: entry next open,
 stop 1.5× ATR beyond entry, target 3× ATR (2R) — capped just inside the
 nearest opposing S/R level, and if that cap drops reward:risk under 1.5

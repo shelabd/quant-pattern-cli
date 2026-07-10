@@ -2225,8 +2225,13 @@ def swing(ticker, as_json, do_notify, cron, do_log, do_score):
     warnings: list[str] = []
     dp = get_provider("yfinance")
     try:
+        # Raw traded prices, not the adjusted series: round-number pump
+        # levels and S/R are tape phenomena (the June 2026 ex-div shifts
+        # May's 750-closes below 750 in adjusted data), and journaled
+        # stops/targets must match what the broker shows. The ~0.25%
+        # quarterly ex-div discontinuity is negligible for the EMAs/ATR.
         df = dp.get_daily_ohlcv(ticker, now_et.date() - timedelta(days=400),
-                                now_et.date())
+                                now_et.date(), auto_adjust=False)
     except Exception as e:
         if cron:
             click.echo(f"swing: daily fetch failed: {e}", err=True)
