@@ -2336,6 +2336,234 @@ def _swing_score(ticker: str, now_et, as_json: bool) -> None:
         display_swing_score(ticker, stats)
 
 
+# ── SCREEN command ──────────────────────────────────────────────────────────────
+
+SCREEN_LOG_PATH = Path.home() / ".qpat" / "screen_journal.jsonl"
+SCREEN_ENRICH_TOP = 50       # finalists that get the slow .info pass
+SCREEN_OPTIONS_TOP = 15      # finalists that get a CBOE chain snapshot
+SCREEN_UNIVERSE_STALE_DAYS = 45
+
+
+@cli.command()
+@click.option("--profile", default="swing",
+              type=click.Choice(["swing", "position", "all"]),
+              help="Factor weighting: swing (days-weeks) or position (weeks-months)")
+@click.option("--top", "-n", default=20, show_default=True,
+              help="Candidates shown per profile")
+@click.option("--json", "as_json", is_flag=True, help="Emit results as JSON")
+@click.option("--notify", "do_notify", is_flag=True,
+              help="Send the top candidates to Telegram")
+@click.option("--cron", is_flag=True,
+              help="Scheduler mode: exit silently before the US close or on non-trading days")
+@click.option("--refresh-universe", "do_refresh", is_flag=True,
+              help="Rebuild ~/.qpat/universe.json from the NASDAQ symbol directory first")
+@click.option("--force-refresh", is_flag=True,
+              help="Ignore the OHLCV disk cache and refetch everything")
+@click.option("--no-options", is_flag=True, help="Skip the CBOE options-flow snapshot")
+@click.option("--no-enrich", is_flag=True,
+              help="Skip the earnings/short-interest/sector enrichment pass")
+@click.option("--min-dollar-vol", default=20.0, show_default=True,
+              help="$M average daily dollar volume floor when refreshing the universe")
+@click.option("--log/--no-log", "do_log", default=True,
+              help="Append top candidates to ~/.qpat/screen_journal.jsonl")
+@click.option("--score", "do_score", is_flag=True,
+              help="Score the screen journal: forward returns vs SPY by profile/score band")
+@click.option("--max-tickers", default=None, type=int,
+              help="Debug: scan only the first N universe tickers")
+def screen(profile, top, as_json, do_notify, cron, do_refresh, force_refresh,
+           no_options, no_enrich, min_dollar_vol, do_log, do_score, max_tickers):
+    """Screen ~1,500 liquid US stocks for rally potential.
+
+    Ranks the universe on six factor families — momentum, 52w-high
+    proximity, trend, volatility squeeze, entry trigger, volume — and
+    blends them into a 0-100 composite per profile so every candidate
+    says WHY it surfaced. Meant to run nightly after the close via
+    launchd with --notify --cron; on demand: qpat screen -n 20.
+    """
+    from .screener import (build_factor_panel, build_results, cross_rank,
+                           family_scores, format_screen_message, log_screen,
+                           options_flow_note)
+    from .screener_data import enrich_finalists, fetch_universe_ohlcv
+    from .swing import ET, SESSION_CLOSE_ET
+    from .universe import load_universe, refresh_universe, universe_age_days
+
+    now_et = datetime.now(ET)
+    if do_score:
+        _screen_score(now_et, as_json)
+        return
+    if cron and (now_et.weekday() >= 5 or now_et.time() < SESSION_CLOSE_ET):
+        return
+
+    if do_refresh:
+        from .screener_data import CACHE_DIR
+
+        console.print("[bold cyan]Refreshing universe from the NASDAQ symbol "
+                      "directory (few minutes)...[/bold cyan]")
+        # A throwaway cache path: the probe fetches only ~90d, and writing
+        # those short frames into the main cache would poison every
+        # subsequent 420d scan into a full refetch.
+        probe_cache = CACHE_DIR / "refresh_probe.pkl"
+        universe = refresh_universe(
+            fetch_ohlcv=lambda tickers: fetch_universe_ohlcv(
+                tickers, lookback_days=90, cache_path=probe_cache)[0],
+            min_dollar_vol=min_dollar_vol * 1e6)
+        probe_cache.unlink(missing_ok=True)
+        console.print(f"[green]✓ Universe refreshed: {len(universe)} tickers[/green]")
+
+    tickers, universe_note = load_universe(max_tickers=max_tickers)
+    age = universe_age_days()
+    if age is not None and age > SCREEN_UNIVERSE_STALE_DAYS:
+        universe_note += f" — {age}d old, consider --refresh-universe"
+
+    fetch_list = tickers if "SPY" in tickers else [*tickers, "SPY"]
+    with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}")) as progress:
+        task = progress.add_task("Fetching OHLCV...", total=None)
+        frames, warnings = fetch_universe_ohlcv(
+            fetch_list, force=force_refresh,
+            progress_cb=lambda msg: progress.update(task, description=f"OHLCV {msg}"))
+
+    # Completed bars only: mid-session runs drop today's partial bar so the
+    # scan can't change before the close.
+    today = now_et.date()
+    if now_et.weekday() < 5 and now_et.time() < SESSION_CLOSE_ET:
+        frames = {t: (df.iloc[:-1] if df.index[-1].date() == today else df)
+                  for t, df in frames.items()}
+        frames = {t: df for t, df in frames.items() if not df.empty}
+        warnings.append("session in progress — scanned yesterday's completed bars")
+
+    spy = frames.get("SPY")
+    if spy is None or spy.empty:
+        if cron:
+            click.echo("screen: SPY fetch failed — aborting", err=True)
+            sys.exit(1)
+        console.print("[red]SPY data unavailable — cannot anchor the scan.[/red]")
+        sys.exit(1)
+    as_of = spy.index[-1].date()
+    if cron and as_of != today:
+        return  # holiday / wake-coalesced run: no fresh bar
+
+    spy_close = float(spy["Close"].iloc[-1])
+    spy_sma200 = float(spy["Close"].rolling(200).mean().iloc[-1])
+    regime = (f"SPY {'above' if spy_close > spy_sma200 else 'below'} its "
+              f"200-DMA ({'risk-on' if spy_close > spy_sma200 else 'risk-off'})")
+
+    scan_frames = {t: df for t, df in frames.items() if t in set(tickers)}
+    with Progress(SpinnerColumn(), TextColumn("[bold blue]{task.description}")) as progress:
+        progress.add_task(f"Scoring {len(scan_frames)} tickers...", total=None)
+        raw_panel = build_factor_panel(scan_frames)
+        pct_panel = cross_rank(raw_panel)
+        fam_panel = family_scores(pct_panel)
+
+    closes = {t: float(df["Close"].iloc[-1]) for t, df in scan_frames.items()}
+    profiles = ["swing", "position"] if profile == "all" else [profile]
+    results_by_profile = {
+        p: build_results(p, as_of, raw_panel, pct_panel, fam_panel, closes, top)
+        for p in profiles}
+
+    finalists = list(dict.fromkeys(
+        r.ticker for results in results_by_profile.values() for r in results))
+    if not no_enrich and finalists:
+        info = enrich_finalists(finalists[:SCREEN_ENRICH_TOP])
+        for results in results_by_profile.values():
+            for r in results:
+                row = info.get(r.ticker) or {}
+                r.sector = row.get("sector")
+                r.earnings_date = row.get("earnings_date")
+                r.short_pct_float = row.get("short_pct_float")
+
+    if not no_options and finalists:
+        from .options_data import fetch_chains, get_options_provider
+
+        chain_provider = get_options_provider("auto")
+        flow_notes: dict[str, Optional[str]] = {}
+        for tkr in finalists[:SCREEN_OPTIONS_TOP]:
+            try:
+                _, chains, _ = fetch_chains(
+                    chain_provider, tkr, as_of,
+                    as_of + timedelta(days=45))
+                flow_notes[tkr] = options_flow_note(chains, closes.get(tkr, 0), as_of)
+            except Exception as e:
+                logger.debug(f"chain snapshot failed for {tkr}: {e}")
+        for results in results_by_profile.values():
+            for r in results:
+                r.options_note = flow_notes.get(r.ticker)
+
+    if do_log:
+        appended = log_screen(
+            [r for results in results_by_profile.values() for r in results],
+            SCREEN_LOG_PATH)
+        if cron and appended == 0:
+            # Second nightly fire (the 22:45 DST-mismatch backup): tonight's
+            # picks are already journaled, so the first fire ran and
+            # notified — exit before sending a duplicate Telegram.
+            return
+        if not cron and appended:
+            console.print(f"  [dim]Journaled {appended} picks to "
+                          f"{SCREEN_LOG_PATH} — score with: qpat screen --score[/dim]")
+
+    if as_json:
+        click.echo(json.dumps(
+            {p: [r.to_dict() for r in results]
+             for p, results in results_by_profile.items()}, indent=2))
+    elif not cron:
+        from .display import display_screen
+        for p, results in results_by_profile.items():
+            display_screen(results, p, universe_note, regime, warnings)
+
+    if do_notify:
+        from .notify import TelegramError, send_telegram
+        try:
+            send_telegram(format_screen_message(results_by_profile, as_of, regime))
+        except TelegramError as e:
+            if cron:
+                click.echo(f"screen: {e}", err=True)
+            else:
+                console.print(f"[red]{e}[/red]")
+            sys.exit(1)
+
+
+def _screen_score(now_et, as_json: bool) -> None:
+    """Forward-return scorecard for the journaled screen picks."""
+    from .data import YFinanceProvider
+    from .screener import load_screen_journal, score_screen_journal
+    from .swing import SESSION_CLOSE_ET
+
+    entries = load_screen_journal(SCREEN_LOG_PATH)
+    if not entries:
+        console.print("[yellow]No screen picks journaled yet — the nightly "
+                      "cron fills ~/.qpat/screen_journal.jsonl.[/yellow]")
+        return
+
+    first = min(date.fromisoformat(e["as_of"]) for e in entries)
+    dp = YFinanceProvider()
+    frame_cache: dict[str, Optional[object]] = {}
+
+    def get_bars(tkr: str, as_of_iso: str):
+        # Adjusted bars on purpose: the screener journals no absolute price
+        # levels, only relative forward returns (see screener.py docstring).
+        if tkr not in frame_cache:
+            try:
+                df = dp.get_daily_ohlcv(tkr, first, now_et.date())
+                if now_et.weekday() < 5 and now_et.time() < SESSION_CLOSE_ET \
+                        and df.index[-1].date() == now_et.date():
+                    df = df.iloc[:-1]
+                frame_cache[tkr] = df
+            except Exception:
+                frame_cache[tkr] = None
+        df = frame_cache[tkr]
+        if df is None:
+            return None
+        after = df[df.index.date > date.fromisoformat(as_of_iso)]
+        return after if not after.empty else None
+
+    stats = score_screen_journal(entries, get_bars)
+    if as_json:
+        click.echo(json.dumps(stats, indent=2))
+    else:
+        from .display import display_screen_score
+        display_screen_score(stats)
+
+
 # ── JOURNAL command ─────────────────────────────────────────────────────────────
 
 @cli.command()

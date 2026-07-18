@@ -1638,3 +1638,116 @@ def display_backtest(reports: list, ticker: str) -> None:
         "as-of date only.\n  Past performance does not guarantee future "
         "results — analysis, not financial advice.", style="dim"))
     console.print()
+
+
+# ── Screen (rally-potential screener) ───────────────────────────────────────────
+
+_SCREEN_FAMILY_ORDER = ["momentum", "hi52", "trend", "squeeze", "trigger", "volume"]
+_SCREEN_FAMILY_LABELS = {"momentum": "mom", "hi52": "52w", "trend": "trd",
+                         "squeeze": "sqz", "trigger": "trg", "volume": "vol"}
+
+
+def _score_style(score: float) -> str:
+    if score >= 80:
+        return "bold green"
+    if score >= 60:
+        return "yellow"
+    return "dim"
+
+
+def display_screen(results: list, profile: str, universe_note: str,
+                   regime: Optional[str] = None,
+                   warnings: Optional[list[str]] = None) -> None:
+    """Ranked screener table for one profile."""
+    header = f"📡 Screen — {profile.upper()} profile"
+    sub = f"universe: {universe_note}"
+    if regime:
+        sub += f" | {regime}"
+    console.print()
+    console.print(Panel(Text(sub), title=header, border_style="cyan"))
+
+    if not results:
+        console.print("[yellow]No candidates survived the scan.[/yellow]")
+        return
+
+    table = Table(box=box.SIMPLE_HEAVY, pad_edge=False)
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Ticker", style="bold", no_wrap=True)
+    table.add_column("Score", justify="right")
+    table.add_column("Families", style="cyan", no_wrap=True)
+    table.add_column("Close", justify="right", no_wrap=True)
+    table.add_column("52wH", justify="right", no_wrap=True)
+    table.add_column("RVOL", justify="right", no_wrap=True)
+    table.add_column("Earn", style="magenta", no_wrap=True)
+    table.add_column("Why", style="dim")
+
+    for i, r in enumerate(results, 1):
+        fams = " ".join(
+            f"{_SCREEN_FAMILY_LABELS[fam]}{v:.0f}"
+            for fam, v in ((f, r.families.get(f)) for f in _SCREEN_FAMILY_ORDER)
+            if v is not None and v == v)
+        table.add_row(
+            str(i), r.ticker,
+            Text(f"{r.score:.0f}", style=_score_style(r.score)),
+            fams,
+            f"{r.close:.2f}" if r.close is not None else "—",
+            f"{r.pct_off_52w_high:+.1f}%" if r.pct_off_52w_high is not None else "—",
+            f"{r.rvol:.1f}x" if r.rvol is not None else "—",
+            (r.earnings_date or "")[5:],  # MM-DD is enough
+            r.reasons[0] if r.reasons else "",
+        )
+    console.print(table)
+
+    notes = []
+    for r in results:
+        if r.options_note:
+            notes.append(f"{r.ticker}: {r.options_note}")
+        if r.short_pct_float is not None and r.short_pct_float >= 10:
+            notes.append(f"{r.ticker}: short interest {r.short_pct_float:.0f}% of float")
+    if notes:
+        console.print(Text("  Options/short-interest notes:", style="bold"))
+        for n in notes:
+            console.print(Text(f"   • {n}", style="dim"))
+
+    for w in warnings or []:
+        console.print(Text(f"  ⚠ {w}", style="yellow"))
+    console.print(Text(
+        "\n  Percentiles are cross-sectional vs today's universe. Candidates "
+        "to research, not entries.\n  Analysis only — not financial advice.",
+        style="dim"))
+    console.print()
+
+
+def display_screen_score(stats: dict) -> None:
+    """Forward-return scorecard for the screen journal."""
+    console.print()
+    console.print(Panel(
+        Text(f"{stats['n_picks']} scored picks, {stats['pending']} pending"),
+        title="📡 Screen journal — forward returns", border_style="cyan"))
+
+    for profile, block in stats.get("by_profile", {}).items():
+        table = Table(title=f"{profile} profile", box=box.SIMPLE_HEAVY)
+        table.add_column("Bucket")
+        for h in (5, 10, 21, 63):
+            table.add_column(f"+{h}d", justify="right")
+
+        def row_cells(buckets: dict) -> list[str]:
+            cells = []
+            for h in (5, 10, 21, 63):
+                b = buckets.get(f"+{h}d") or {}
+                if not b.get("n"):
+                    cells.append("—")
+                else:
+                    cells.append(f"{b['avg_pct']:+.1f}% ({b['win_rate']:.0%} "
+                                 f"n={b['n']}, vs SPY {b['avg_vs_spy_pct']:+.1f}%)")
+            return cells
+
+        table.add_row("overall", *row_cells(block["overall"]))
+        for band, buckets in block.get("by_score_band", {}).items():
+            table.add_row(f"score {band}", *row_cells(buckets))
+        console.print(table)
+
+    console.print(Text(
+        "  Forward test only — picks were journaled before the outcome. "
+        "Analysis, not financial advice.", style="dim"))
+    console.print()

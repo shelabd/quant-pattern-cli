@@ -28,3 +28,6 @@ qpat = "quant_patterns.cli:cli"
 
 [tool.setuptools.packages.find]
 include = ["quant_patterns*"]
+
+[tool.setuptools.package-data]
+quant_patterns = ["data/*.csv"]

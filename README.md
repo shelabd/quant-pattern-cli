@@ -226,6 +226,54 @@ qpat swing SPY --notify --cron   # what the nightly launchd job runs
 qpat swing --score               # how have the signals actually done?
 ```
 
+### `qpat screen`
+**Rally-potential screener** over ~1,500 liquid US stocks. Ranks the
+universe cross-sectionally on six factor families — **momentum** (12-1/6m/3m),
+**52w-high proximity**, **trend** (EMA stack, 200-SMA persistence),
+**squeeze** (BB-width percentile, ATR contraction, NR7), **trigger**
+(20d/50d-high breakouts, close-in-range), **volume** (RVOL, OBV slope,
+up/down volume) — and blends them into a 0-100 composite per profile:
+`swing` (days-weeks: squeeze/trigger/volume heavy) or `position`
+(weeks-months: momentum/52wH/trend heavy). Every candidate reports its
+family sub-scores and plain-English reasons, so the output says *why* a
+name surfaced. Scores are percentiles vs today's universe, not absolute
+claims.
+
+The universe lives at `~/.qpat/universe.json` (rebuild with
+`--refresh-universe`: NASDAQ symbol directory → top 1,500 by 20d average
+dollar volume); until the first refresh a bundled snapshot is used. Daily
+bars are bulk-fetched in chunks and cached to
+`~/.qpat/screener_cache/ohlcv.pkl`, so warm nightly runs fetch only the
+missing tail. Top finalists get an earnings-date / short-interest /
+sector enrichment pass (7-day cache) and a CBOE options-flow snapshot
+(C/P volume ratio + near-dated OTM call share — a same-day heuristic,
+fail-soft). Factors use **adjusted** prices (momentum/52wH need them);
+the journal therefore scores *relative forward returns* on the same
+adjusted series — unlike swing/fly, no absolute price level is journaled.
+
+| Flag | Description |
+|------|-------------|
+| `--profile swing\|position\|all` | Factor weighting (default swing) |
+| `--top / -n` | Candidates per profile (default 20) |
+| `--notify` / `--cron` | Telegram delivery / scheduler mode (same semantics as `swing`) |
+| `--refresh-universe` | Rebuild the universe from the NASDAQ symbol directory |
+| `--force-refresh` | Ignore the OHLCV cache and refetch everything (also deepens history) |
+| `--no-enrich` / `--no-options` | Skip the slow finalist passes |
+| `--score` | Forward-return scorecard of journaled picks: +5/+10/+21/+63-session returns, absolute and vs SPY, by profile and score band |
+| `--max-tickers N` | Debug: scan a truncated universe |
+
+```bash
+qpat screen                       # swing profile, top 20
+qpat screen --profile all -n 10   # both profiles
+qpat screen --score               # are the picks actually rallying?
+qpat screen --refresh-universe    # monthly universe rebuild
+```
+
+Nightly launchd agent `com.shelabd.qpat-screen` runs
+`qpat screen --profile all --top 10 --notify --cron` at 21:45 London
+Mon-Fri (22:45 backup fire for the London/NY DST-mismatch weeks; the
+journal dedup makes the second fire exit before re-notifying).
+
 ### `qpat sr TICKER`
 Support & resistance detection using local extrema clustering. Shows touch count and strength.
 
